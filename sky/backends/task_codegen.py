@@ -563,7 +563,11 @@ class RayCodeGen(TaskCodeGen):
                 ])
 
                 cluster_ips_to_node_id = {{ip: i for i, ip in enumerate({stable_cluster_internal_ips!r})}}
-                job_ip_rank_list = sorted(gang_scheduling_id_to_ip, key=cluster_ips_to_node_id.get)
+                # Unmapped IPs (multi-NIC: Ray reports a NIC SkyPilot didn't record)
+                # sort last, deterministically, instead of crashing the whole job.
+                job_ip_rank_list = sorted(
+                    gang_scheduling_id_to_ip,
+                    key=lambda ip: (cluster_ips_to_node_id.get(ip, len(cluster_ips_to_node_id)), ip))
                 job_ip_rank_map = {{ip: i for i, ip in enumerate(job_ip_rank_list)}}
                 job_ip_list_str = '\\n'.join(job_ip_rank_list)
                 """),
@@ -656,8 +660,8 @@ class RayCodeGen(TaskCodeGen):
                 name_str = '{task_name},' if {task_name!r} != None else 'task,'
                 log_path = os.path.expanduser(os.path.join({log_dir!r}, 'run.log'))
             else: # Single-node or multi-node task on multi-node cluster
-                idx_in_cluster = cluster_ips_to_node_id[ip]
-                if cluster_ips_to_node_id[ip] == 0:
+                idx_in_cluster = cluster_ips_to_node_id.get(ip, len(cluster_ips_to_node_id) + {gang_scheduling_id!r})
+                if idx_in_cluster == 0:
                     node_name = 'head'
                 else:
                     node_name = f'worker{{idx_in_cluster}}'
@@ -917,24 +921,26 @@ class SlurmCodeGen(TaskCodeGen):
                     # SLURM_CPU_BIND, SLURM_NNODES, and SLURM_NODELIST constrain
                     # the inner srun to the parent step's allocation. This causes
                     # "CPU binding outside of job step allocation" errors.
-                    # Unsetting all SLURM_* variables allows this srun to access the full job
-                    # allocation. See:
+                    # Unsetting SLURM_* variables allows this srun to access the
+                    # full job allocation. See:
                     # https://support.schedmd.com/show_bug.cgi?id=14298
                     # https://github.com/huggingface/datatrove/issues/248
-                    cmd_parts = []
-                    # Only unset SKY_RUNTIME_DIR for container runs. For non-container
-                    # runs, we want to inherit the node-local SKY_RUNTIME_DIR set by
-                    # SlurmCommandRunner to avoid SQLite WAL issues on shared filesystems.
-                    if {True if container_flags else False}:
-                        cmd_parts.append('unset SKY_RUNTIME_DIR;')
-                    cmd_parts.extend([
+                    #
+                    # Preserve SLURM_CONF* (SLURM_CONF, SLURM_CONF_SERVER): srun
+                    # needs these to locate slurmctld when /etc/slurm/slurm.conf
+                    # is not present and DNS SRV discovery is unavailable. On
+                    # sites that distribute the config via SLURM_CONF, stripping
+                    # it causes srun to fail with:
+                    #   resolve_ctls_from_dns_srv: res_nsearch error: Unknown host
+                    #   fetch_config: DNS SRV lookup failed
+                    #   fatal: Could not establish a configuration source
+                    bash_cmd = shlex.quote(' '.join([
                         constants.SKY_SLURM_PYTHON_CMD,
                         '-m sky.skylet.executor.slurm',
                         runner_args,
-                    ])
-                    bash_cmd = shlex.quote(' '.join(cmd_parts))
+                    ]))
                     srun_cmd = (
-                        "unset $(env | awk -F= '/^SLURM_/ {{print $1}}') && "
+                        "unset $(env | awk -F= '/^SLURM_/ && $1 !~ /^SLURM_CONF/ {{print $1}}') && "
                         f'srun --export=ALL --quiet --unbuffered --kill-on-bad-exit --jobid={self._slurm_job_id} '
                         f'--job-name=sky-{self.job_id}{{job_suffix}} --ntasks-per-node=1{container_flags} {{extra_flags}} '
                         f'/bin/bash -c {{bash_cmd}}'

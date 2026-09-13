@@ -11,7 +11,26 @@ document.addEventListener('DOMContentLoaded', function () {
        script.setAttribute('data-website-id', '4223d017-a3d2-4b92-b191-ea4d425a23c3');
        script.setAttribute('data-project-name', 'SkyPilot');
        script.setAttribute('data-project-color', '#4C4C4D');
-       script.setAttribute('data-project-logo', 'https://avatars.githubusercontent.com/u/109387420?s=100&v=4');
+       // Follow the docs theme toggle (pydata-sphinx-theme sets
+       // html[data-theme="dark"]) so the widget switches with the site.
+       script.setAttribute('data-color-scheme-selector', "html[data-theme='dark']");
+       // Light mode: solid white launcher button with black text, no shadow.
+       script.setAttribute('data-launcher-button-background-color', '#FFFFFF');
+       script.setAttribute('data-launcher-button-hover-background-color', '#FFFFFF');
+       script.setAttribute('data-launcher-button-border', 'none');
+       script.setAttribute('data-launcher-button-color', '#000000');
+       script.setAttribute('data-launcher-button-text-shadow', 'none');
+       script.setAttribute('data-launcher-button-label-color', '#000000');
+       script.setAttribute('data-launcher-button-label-text-shadow', 'none');
+       // Dark mode: dark launcher surface with white text.
+       script.setAttribute('data-launcher-button-background-color-dark', '#1F242C');
+       script.setAttribute('data-launcher-button-hover-background-color-dark', '#1F242C');
+       script.setAttribute('data-launcher-button-border-dark', 'none');
+       script.setAttribute('data-launcher-button-color-dark', '#FFFFFF');
+       script.setAttribute('data-launcher-button-text-shadow-dark', 'none');
+       script.setAttribute('data-launcher-button-label-color-dark', '#FFFFFF');
+       script.setAttribute('data-launcher-button-label-text-shadow-dark', 'none');
+       script.setAttribute('data-project-logo', 'https://raw.githubusercontent.com/skypilot-org/skypilot/master/docs/source/_static/skypilot-icon.png');
        script.setAttribute('data-modal-disclaimer', 'Results are automatically generated and may be inaccurate or contain inappropriate information. Do not include any sensitive information in your query.\n**To get further assistance, you can chat directly with the development team** by joining the [SkyPilot Slack](https://slack.skypilot.co/).');
        script.setAttribute('data-modal-title', 'SkyPilot Docs AI - Ask a Question.');
        script.setAttribute('data-button-position-bottom', '100px');
@@ -30,18 +49,40 @@ document.addEventListener('DOMContentLoaded', function () {
 })(window,document,'https://static.hotjar.com/c/hotjar-','.js?sv=');
 !function(t){var k="ko",i=(window.globalKoalaKey=window.globalKoalaKey||k);if(window[i])return;var ko=(window[i]=[]);["identify","track","removeListeners","on","off","qualify","ready"].forEach(function(t){ko[t]=function(){var n=[].slice.call(arguments);return n.unshift(t),ko.push(n),ko}});var n=document.createElement("script");n.async=!0,n.setAttribute("src","https://cdn.getkoala.com/v1/pk_d9bb6290ccb8a01b2d181fc0c8cf0dbb9836/sdk.js"),(document.body || document.head).appendChild(n)}();
 
+// Website analytics
+(function() {
+    if (typeof window === 'undefined') return;
+    if (typeof window.signals !== 'undefined') return;
+    var script = document.createElement('script');
+    script.src = 'https://cdn.cr-relay.com/v1/site/1537a3d1-43b9-4d6c-8efa-8d60f2326b23/signals.js';
+    script.async = true;
+    var signals = window.signals = Object.assign(
+        [],
+        { _opts: { apiHost: 'https://api.cr-relay.com' } },
+        ['page', 'identify', 'form'].reduce(function (acc, method){
+            acc[method] = function () {
+                signals.push([method, arguments]);
+                return signals;
+            };
+            return acc;
+        }, {})
+    );
+    document.head.appendChild(script);
+})();
+
 // New items: add 'new-item' class for for new items.
 document.addEventListener('DOMContentLoaded', () => {
     // New items:
     const newItems = [
         { selector: '.toctree-l2 > a', text: 'HTTPS Encryption' },
-        { selector: '.toctree-l2 > a', text: 'Upgrading API Server' },
-        { selector: '.toctree-l1 > a', text: 'Using a Pool of Workers' },
+        { selector: '.toctree-l1 > a', text: 'Batch Inference' },
         { selector: '.toctree-l1 > a', text: 'Job Groups' },
         { selector: '.toctree-l1 > a', text: 'Using Slurm' },
-        { selector: '.toctree-l1 > a', text: 'SkyPilot Recipes' },
-        { selector: '.toctree-l1 > a', text: 'Agent Skills' },
+        { selector: '.toctree-l1 > a', text: 'SkyPilot Platform' },
         { selector: '.toctree-l2 > a', text: 'Agents' },
+        { selector: '.toctree-l2 > a', text: 'Sandboxes' },
+        { selector: '.toctree-l1 > a', text: 'Lifecycle hooks' },
+        { selector: '.toctree-l1 > a', text: 'SkyPilot Endpoints' },
     ];
     newItems.forEach(({ selector, text }) => {
         document.querySelectorAll(selector).forEach((el) => {
@@ -49,6 +90,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 el.classList.add('new-item');
             }
         });
+    });
+});
+
+// Auto-expand the "SkyPilot Platform" section so its nested items (and their
+// "New" badges) are visible in the sidebar without a manual click.
+document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('.toctree-l1').forEach((li) => {
+        const link = li.querySelector(':scope > a');
+        if (link && link.textContent.includes('SkyPilot Platform')) {
+            const checkbox = li.querySelector(':scope > input.toctree-checkbox');
+            if (checkbox) checkbox.checked = true;
+        }
     });
 });
 
@@ -72,10 +125,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const mdUrl = pagePath + '.md';
 
     // SVG icons.
-    const copyIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-    const arrowIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg>';
-    const chevronIcon = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
-    const checkIcon = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+    const copyIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+    const arrowIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7 7 17 7 17 17"/></svg>';
+    const chevronIcon = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
+    const checkIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
 
     // Build the split button widget.
     const wrapper = document.createElement('div');
@@ -90,9 +143,14 @@ document.addEventListener('DOMContentLoaded', () => {
             `<button class="copy-page-item" data-action="open">${arrowIcon} Open Markdown</button>` +
         `</div>`;
 
-    // Insert after the h1 — position absolutely relative to h1's section.
-    h1.style.position = 'relative';
-    h1.appendChild(wrapper);
+    // Wrap the h1 and the button as flex siblings so the title gets its own
+    // flex track and the button sits beside it without competing for the h1's
+    // inline width.
+    const titleRow = document.createElement('div');
+    titleRow.className = 'bd-title-row';
+    h1.parentNode.insertBefore(titleRow, h1);
+    titleRow.appendChild(h1);
+    titleRow.appendChild(wrapper);
 
     const mainBtn = wrapper.querySelector('.copy-page-main');
     const toggleBtn = wrapper.querySelector('.copy-page-toggle');

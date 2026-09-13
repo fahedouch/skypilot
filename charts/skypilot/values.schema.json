@@ -38,6 +38,14 @@
                         "null"
                     ]
                 },
+                "devMode": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean"
+                        }
+                    }
+                },
                 "enableServiceAccounts": {
                     "type": "boolean"
                 },
@@ -71,6 +79,13 @@
                         "type": "object"
                     }
                 },
+                "host": {
+                    "type": "string",
+                    "enum": [
+                        "0.0.0.0",
+                        "::"
+                    ]
+                },
                 "image": {
                     "type": "string"
                 },
@@ -88,6 +103,31 @@
                         "string",
                         "null"
                     ]
+                },
+                "livenessProbe": {
+                    "type": [
+                        "object",
+                        "null"
+                    ],
+                    "properties": {
+                        "httpGet": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string"
+                                },
+                                "port": {
+                                    "type": "integer"
+                                }
+                            }
+                        },
+                        "periodSeconds": {
+                            "type": "integer"
+                        },
+                        "timeoutSeconds": {
+                            "type": "integer"
+                        }
+                    }
                 },
                 "logs": {
                     "type": "object",
@@ -119,14 +159,68 @@
                 "nodeSelector": {
                     "type": "object"
                 },
+                "persistSSHConfig": {
+                    "type": "boolean"
+                },
                 "preDeployHook": {
                     "type": "string"
+                },
+                "readinessProbe": {
+                    "type": [
+                        "object",
+                        "null"
+                    ],
+                    "properties": {
+                        "failureThreshold": {
+                            "type": "integer"
+                        },
+                        "httpGet": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string"
+                                },
+                                "port": {
+                                    "type": "integer"
+                                }
+                            }
+                        },
+                        "initialDelaySeconds": {
+                            "type": "integer"
+                        },
+                        "periodSeconds": {
+                            "type": "integer"
+                        },
+                        "timeoutSeconds": {
+                            "type": "integer"
+                        }
+                    }
                 },
                 "replicas": {
                     "type": "integer"
                 },
                 "resources": {
                     "type": "object"
+                },
+                "rollingUpdate": {
+                    "type": [
+                        "object",
+                        "null"
+                    ],
+                    "properties": {
+                        "maxSurge": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ]
+                        },
+                        "maxUnavailable": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ]
+                        }
+                    }
                 },
                 "serveServerLog": {
                     "type": "boolean"
@@ -635,6 +729,12 @@
                                     "type": "string"
                                 }
                             },
+                            "resourceNames": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            },
                             "resources": {
                                 "type": "array",
                                 "items": {
@@ -752,8 +852,14 @@
                 "annotations": {
                     "type": "object"
                 },
+                "clientsSubPath": {
+                    "type": "string"
+                },
                 "enabled": {
                     "type": "boolean"
+                },
+                "existingClaim": {
+                    "type": "string"
                 },
                 "selector": {
                     "type": "object"

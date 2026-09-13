@@ -5,6 +5,8 @@ This module contains tests for the CLI utilities in sky.utils.cli_utils.
 import re
 import time
 
+import colorama
+
 from sky import backends
 from sky.resources import Resources
 from sky.utils import status_lib
@@ -205,21 +207,33 @@ def test_get_command():
 def test_get_autostop():
     """Test autostop display in status table."""
     mock_record = {
-        'autostop': 300,  # 5 minutes
+        'autostop': 300,  # multiple of 60 minutes -> rendered in hours
         'to_down': False,
     }
 
-    # Test normal autostop
+    # Multiples of 60 minutes are rendered in hours.
     autostop_str = status_utils._get_autostop(mock_record)
-    assert autostop_str == '300m'
+    assert autostop_str == '5h'
 
-    # Test autostop with to_down
+    # Hours rendering is preserved with to_down.
     mock_record['to_down'] = True
     autostop_str = status_utils._get_autostop(mock_record)
-    assert autostop_str == '300m (down)'
+    assert autostop_str == '5h (down)'
+
+    # Non-multiples of 60 stay in minutes.
+    mock_record['autostop'] = 90
+    mock_record['to_down'] = False
+    autostop_str = status_utils._get_autostop(mock_record)
+    assert autostop_str == '90m'
+
+    # 0 stays in minutes (immediate autostop).
+    mock_record['autostop'] = 0
+    autostop_str = status_utils._get_autostop(mock_record)
+    assert autostop_str == '0m'
 
     # Test no autostop
     mock_record['autostop'] = -1
+    mock_record['to_down'] = True
     autostop_str = status_utils._get_autostop(mock_record)
     assert autostop_str == '(down)'
 
@@ -486,3 +500,37 @@ def test_get_resources_fractional_values():
     simple, full = resources_utils.format_resource(mock_resources_int)
     assert 'cpus=4' in simple and 'cpus=4' in full
     assert 'mem=8' in simple and 'mem=8' in full
+
+
+def test_get_status_colored_unhealthy_init():
+    """INIT clusters flagged unhealthy render as UNHEALTHY; others do not."""
+    # An INIT cluster stuck in an abnormal state renders as red UNHEALTHY.
+    unhealthy_record = {
+        'status': status_lib.ClusterStatus.INIT,
+        'init_kind': status_lib.INIT_KIND_UNHEALTHY,
+    }
+    colored = status_utils._get_status_colored(unhealthy_record)
+    assert 'UNHEALTHY' in colored
+    assert colorama.Fore.RED in colored
+    assert 'INIT' not in colored
+
+    # An actively-launching INIT cluster still renders as INIT.
+    launching_record = {
+        'status': status_lib.ClusterStatus.INIT,
+        'init_kind': status_lib.INIT_KIND_LAUNCHING,
+    }
+    assert 'INIT' in status_utils._get_status_colored(launching_record)
+
+    # A record without init_kind (e.g. from an older server) falls back to
+    # INIT.
+    legacy_record = {'status': status_lib.ClusterStatus.INIT}
+    assert 'INIT' in status_utils._get_status_colored(legacy_record)
+
+    # Non-INIT statuses are unaffected even if init_kind is somehow set.
+    up_record = {
+        'status': status_lib.ClusterStatus.UP,
+        'init_kind': status_lib.INIT_KIND_UNHEALTHY,
+    }
+    colored = status_utils._get_status_colored(up_record)
+    assert 'UP' in colored
+    assert 'UNHEALTHY' not in colored

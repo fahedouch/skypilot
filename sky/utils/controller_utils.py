@@ -6,7 +6,7 @@ import os
 import pathlib
 import tempfile
 import typing
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import uuid
 
 import colorama
@@ -23,6 +23,7 @@ from sky.clouds import gcp
 from sky.data import data_utils
 from sky.data import storage as storage_lib
 from sky.jobs import constants as managed_job_constants
+from sky.jobs import state as managed_job_state
 from sky.provision.kubernetes import constants as kubernetes_constants
 from sky.serve import constants as serve_constants
 from sky.serve import serve_state
@@ -34,6 +35,7 @@ from sky.server.blob import blob_storage as bs
 from sky.setup_files import dependencies
 from sky.skylet import constants
 from sky.skylet import log_lib
+from sky.usage import constants as usage_constants
 from sky.utils import annotations
 from sky.utils import command_runner
 from sky.utils import common
@@ -323,7 +325,7 @@ def _get_cloud_dependencies_installation_commands(
     k8s_and_ssh_label = ' and '.join(sorted(enabled_k8s_and_ssh))
     k8s_dependencies_installed = False
 
-    for cloud in enabled_clouds:
+    for cloud in sorted(enabled_clouds, key=repr):
         cloud_python_dependencies: List[str] = copy.deepcopy(
             dependencies.extras_require[cloud.canonical_name()])
 
@@ -418,7 +420,13 @@ def _get_cloud_dependencies_installation_commands(
         if sc.lower() in constants.STORAGE_ONLY_CLOUDS:
             python_packages.update(dependencies.extras_require[sc.lower()])
 
-    packages_string = ' '.join([f'"{package}"' for package in python_packages])
+    # Pin click<8.3.0: typer>=0.25.0 requires click>=8.2.1 with no upper
+    # bound, which lets uv resolve click to 8.3.x. click 8.3.0+ breaks Ray
+    # CLI on the controller via copy.deepcopy on Click's Sentinel values.
+    # See https://github.com/ray-project/ray/issues/56747.
+    python_packages.add('click<8.3.0')
+    packages_string = ' '.join(
+        [f'"{package}"' for package in sorted(python_packages)])
     step_prefix = prefix_str.replace('<step>', str(len(commands) + 1))
     commands.append(
         f'echo -en "\\r{step_prefix}cloud python packages{empty_str}" && '
@@ -462,10 +470,19 @@ def download_and_stream_job_log(
         backend: 'cloud_vm_ray_backend.CloudVmRayBackend',
         handle: 'cloud_vm_ray_backend.CloudVmRayResourceHandle',
         local_dir: str,
-        job_ids: Optional[List[str]] = None) -> Optional[str]:
+        job_ids: Optional[List[str]] = None,
+        on_downloaded: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Downloads and streams the latest job log.
 
     This function is only used by jobs controller and sky serve controller.
+
+    Args:
+        on_downloaded: Optional callback invoked with the local log path as
+            soon as the log has been synced down, BEFORE the (potentially
+            slow) re-streaming of the log into the controller log. The jobs
+            controller uses this to persist ``local_log_file`` immediately so
+            the dashboard can serve the job's logs without waiting for the
+            full re-stream to finish.
 
     If the log cannot be fetched for any reason, return None.
     """
@@ -500,11 +517,34 @@ def download_and_stream_job_log(
     log_dir = list(log_dirs.values())[0]
     log_file = os.path.expanduser(os.path.join(log_dir, 'run.log'))
 
+    # The log is now on local disk. Notify the caller immediately so it can
+    # persist the path (e.g. local_log_file) before the slow re-stream below,
+    # which can take minutes for multi-GB logs and would otherwise block the
+    # dashboard from serving the logs.
+    if on_downloaded is not None:
+        on_downloaded(log_file)
+
     # Print the logs to the console.
     # TODO(zhwu): refactor this into log_utils, along with the refactoring for
     # the log_lib.tail_logs.
     try:
-        with open(log_file, 'r', encoding='utf-8') as f:
+        # newline='\n' so we split lines ONLY on '\n'. The default
+        # universal-newline mode treats every '\r' as a line boundary, which
+        # for carriage-return progress output (e.g. `aws s3 cp`'s in-place
+        # "Completed X GiB ..." updates) explodes a multi-GB log into millions
+        # of "lines" -- making this loop O(carriage-returns) (minutes for a
+        # ~160MB log) and bloating the controller log accordingly. Splitting
+        # only on '\n' keeps it O(real lines). We also drop the per-line
+        # flush: stdout is block-buffered (~8KB), so a hard crash loses at
+        # most the last buffer, not the whole copy -- and the authoritative
+        # copy is the synced run.log on disk anyway. errors='replace' so a
+        # stray invalid-UTF-8 byte in the user log can't abort the copy
+        # mid-stream (matches log_lib's decode handling).
+        with open(log_file,
+                  'r',
+                  encoding='utf-8',
+                  newline='\n',
+                  errors='replace') as f:
             # Stream the logs to the console without reading the whole file into
             # memory.
             start_streaming = False
@@ -512,7 +552,9 @@ def download_and_stream_job_log(
                 if log_lib.LOG_FILE_START_STREAMING_AT in line:
                     start_streaming = True
                 if start_streaming:
-                    print(line, end='', flush=True)
+                    print(line, end='')
+        # Flush once after the full copy instead of once per line.
+        print(end='', flush=True)
     except FileNotFoundError:
         logger.error('Failed to find the logs for the user '
                      f'program at {log_file}.')
@@ -568,8 +610,15 @@ def shared_controller_vars_to_fill(
         constants.USING_REMOTE_API_SERVER_ENV_VAR: str(
             common_utils.get_using_remote_api_server()),
     })
-    if skypilot_config.loaded():
-        # Only set the SKYPILOT_CONFIG env var if the user has a config file.
+    # Only set the SKYPILOT_CONFIG env var when we actually file_mount a
+    # config to the controller (i.e. local_user_config was non-empty so
+    # local_user_config_path is a real tempfile that gets rsynced/SSH'd to
+    # remote_user_config_path on the controller). Previously this gated on
+    # `skypilot_config.loaded()` (API server's own config), which can be True
+    # even when local_user_config is empty — pointing the controller's
+    # SKYPILOT_CONFIG env to a file that was never created and crashing it
+    # with FileNotFoundError on startup.
+    if local_user_config_path is not None:
         env_vars[
             skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = remote_user_config_path
     vars_to_fill['controller_envs'].update(env_vars)
@@ -618,6 +667,15 @@ def controller_only_vars_to_fill(controller: Controllers) -> Dict[str, str]:
     if override_concurrent_launches is not None:
         env_vars[constants.SERVE_OVERRIDE_CONCURRENT_LAUNCHES] = str(
             int(override_concurrent_launches))
+    # Forward the client's usage run id so the controller (and the worker
+    # clusters it provisions) report heartbeats under the same run id as
+    # the originating launch operation. Without this, in consolidation mode
+    # the controller process would fall back to its own
+    # usage_lib.messages.usage singleton, which is shared across all jobs
+    # served by that process and so cannot distinguish between them.
+    client_usage_run_id = os.environ.get(usage_constants.USAGE_RUN_ID_ENV_VAR)
+    if client_usage_run_id is not None:
+        env_vars[usage_constants.USAGE_RUN_ID_ENV_VAR] = client_usage_run_id
     vars_to_fill['controller_envs'] = env_vars
     return vars_to_fill
 
@@ -984,9 +1042,6 @@ def maybe_translate_local_file_mounts_and_sync_up(task: 'task_lib.Task',
 
     # We use uuid to generate a unique run id for the job, so that the bucket/
     # subdirectory name is unique across different jobs/services.
-    # We should not use common_utils.get_usage_run_id() here, because when
-    # Python API is used, the run id will be the same across multiple
-    # jobs.launch/serve.up calls after the sky is imported.
     run_id = _generate_run_uuid()
     user_hash = common_utils.get_user_hash()
     original_file_mounts = task.file_mounts if task.file_mounts else {}
@@ -1323,37 +1378,68 @@ MAX_TOTAL_RUNNING_JOBS = 2000
 _CONSOLIDATION_WORKER_MEMORY_FRACTION = 0.7
 
 
+def _controller_headroom_mb(reserve_extra_for_pool: bool) -> float:
+    """Memory kept free on top of whatever the controllers themselves use."""
+    headroom = float(MAXIMUM_CONTROLLER_RESERVED_MEMORY_MB)
+    if reserve_extra_for_pool:
+        headroom *= (1. + POOL_JOBS_RESOURCES_RATIO)
+    return headroom
+
+
+def _consolidation_worker_reserved_mb(reserve_extra_for_pool: bool) -> float:
+    """Headroom plus the share set aside for the in-process controllers.
+
+    Scales with system memory, so a machine that can run more concurrent jobs
+    also holds back more memory for their controller processes. Below
+    MIN_AVAIL_MB the controller share is skipped so workers get everything.
+    """
+    headroom = _controller_headroom_mb(reserve_extra_for_pool)
+    total_memory_mb = common_utils.get_mem_size_gb() * 1024 - headroom
+    min_avail_mb = (server_constants.MIN_AVAIL_MEM_GB_CONSOLIDATION_MODE * 1024)
+    controllers_reserved = min(
+        total_memory_mb * (1 - _CONSOLIDATION_WORKER_MEMORY_FRACTION),
+        max(0, total_memory_mb - min_avail_mb))
+    return headroom + controllers_reserved
+
+
 def compute_memory_reserved_for_controllers(
-        reserve_for_controllers: bool, reserve_extra_for_pool: bool) -> float:
-    reserved_memory_mb = 0.0
-    if reserve_for_controllers:
-        reserved_memory_mb = float(MAXIMUM_CONTROLLER_RESERVED_MEMORY_MB)
-        if reserve_extra_for_pool:
-            reserved_memory_mb *= (1. + POOL_JOBS_RESOURCES_RATIO)
-    return reserved_memory_mb
+        reserve_extra_for_pool: bool) -> float:
+    """Memory (MB) to withhold from API server worker sizing.
+
+    In consolidation mode the jobs and serve/pool controllers run as processes
+    inside the API server, so their memory has to be withheld before the
+    executor pools are sized. Returns the same quantity
+    _get_total_usable_memory_mb() assumes the workers left behind, so both
+    sides of the split agree on one number. Returns 0 outside consolidation
+    mode, where the controllers run on their own cluster.
+    """
+    if os.environ.get(constants.OVERRIDE_CONSOLIDATION_MODE) is not None:
+        # A local API server started from a controller process, which inherits
+        # its env. _get_parallelism() sizes that machine assuming only the flat
+        # headroom was withheld, so withhold exactly that.
+        return _controller_headroom_mb(reserve_extra_for_pool)
+    if not env_options.Options.MEMORY_AWARE_WORKER_SIZING.get():
+        return 0.0
+    # Either kind of consolidation puts controller processes in the API
+    # server's own memory.
+    if not is_jobs_consolidation_mode() and not _is_consolidation_mode(
+            pool=False):
+        return 0.0
+    return _consolidation_worker_reserved_mb(reserve_extra_for_pool)
 
 
 def _get_total_usable_memory_mb(pool: bool, consolidation_mode: bool) -> float:
-    controller_reserved = compute_memory_reserved_for_controllers(
-        reserve_for_controllers=True, reserve_extra_for_pool=pool)
-    total_memory_mb = (common_utils.get_mem_size_gb() * 1024 -
-                       controller_reserved)
+    headroom = _controller_headroom_mb(reserve_extra_for_pool=pool)
+    total_memory_mb = common_utils.get_mem_size_gb() * 1024 - headroom
     if not consolidation_mode:
         return total_memory_mb
-    # Cap the memory available for server workers so that both workers and
-    # services scale with system memory. Without this cap, short workers
-    # grow linearly with memory, consuming nearly all of it and leaving a
-    # roughly fixed amount for services regardless of system memory size.
-    # In low-memory scenarios (total_memory_mb <= MIN_AVAIL_MB), skip the
-    # service reservation so workers get all available memory; otherwise
-    # guarantee workers at least MIN_AVAIL_MB and cap them at the fraction.
-    min_avail_mb = (server_constants.MIN_AVAIL_MEM_GB_CONSOLIDATION_MODE * 1024)
-    service_reserved = min(
-        total_memory_mb * (1 - _CONSOLIDATION_WORKER_MEMORY_FRACTION),
-        max(0, total_memory_mb - min_avail_mb))
-    worker_reserved = controller_reserved + service_reserved
+    # Size the workers against the same reservation the API server uses, then
+    # hand the controllers whatever the workers did not take.
     config = server_config.compute_server_config(
-        deploy=True, quiet=True, reserved_memory_mb=worker_reserved)
+        deploy=True,
+        quiet=True,
+        reserved_memory_mb=_consolidation_worker_reserved_mb(
+            reserve_extra_for_pool=pool))
     used = 0.0
     used += ((config.long_worker_config.garanteed_parallelism +
               config.long_worker_config.burstable_parallelism) *
@@ -1361,6 +1447,10 @@ def _get_total_usable_memory_mb(pool: bool, consolidation_mode: bool) -> float:
     used += ((config.short_worker_config.garanteed_parallelism +
               config.short_worker_config.burstable_parallelism) *
              server_config.SHORT_WORKER_MEM_GB * 1024)
+    if env_options.Options.MEMORY_AWARE_WORKER_SIZING.get():
+        # Server workers are resident too, and the parent process with them.
+        used += ((config.num_server_workers + 1) *
+                 server_config.SERVER_WORKER_MEM_GB * 1024)
     return total_memory_mb - used
 
 
@@ -1371,12 +1461,129 @@ def _is_consolidation_mode(pool: bool) -> bool:
     if pool:
         # For jobs, the signal file is the source of truth (managed by
         # setup_consolidation_mode_on_startup at server start).
-        signal_file = pathlib.Path(
-            managed_job_constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE
-        ).expanduser()
-        return signal_file.exists()
+        return _read_jobs_consolidation_signal()
     return skypilot_config.get_nested(
         ('serve', 'controller', 'consolidation_mode'), default_value=False)
+
+
+def _read_jobs_consolidation_signal() -> bool:
+    """Return whether the jobs consolidation signal file is present.
+
+    Source of truth for jobs-controller consolidation state. The file is
+    written by setup_consolidation_mode_on_startup at API server start.
+    """
+    signal_file = pathlib.Path(
+        managed_job_constants.JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE
+    ).expanduser()
+    return signal_file.exists()
+
+
+def warn_jobs_consolidation_mode_intent(enabled: bool) -> None:
+    """Warn about leftover state that would block a consolidation-mode flip.
+
+    - enabled=True: warn if a separate jobs-controller cluster still exists.
+    - enabled=False: warn if managed jobs are still running.
+
+    Called from is_jobs_consolidation_mode (server-side) and from
+    setup_consolidation_mode_on_startup (at API server start).
+    """
+    if enabled:
+        controller_cn = (Controllers.JOBS_CONTROLLER.value.cluster_name)
+        if global_user_state.cluster_with_name_exists(controller_cn):
+            logger.warning(
+                f'{colorama.Fore.RED}Consolidation mode for jobs is enabled, '
+                f'but the controller cluster {controller_cn} is still running. '
+                'Please terminate the controller cluster first.'
+                f'{colorama.Style.RESET_ALL}')
+    else:
+        total_jobs = managed_job_state.get_managed_jobs_total()
+        if total_jobs > 0:
+            nonterminal_jobs = (
+                managed_job_state.get_nonterminal_job_ids_by_name(
+                    None, None, all_users=True))
+            if nonterminal_jobs:
+                logger.warning(
+                    f'{colorama.Fore.YELLOW}Consolidation mode is disabled, '
+                    f'but there are still {len(nonterminal_jobs)} managed jobs '
+                    'running. Please terminate those jobs first.'
+                    f'{colorama.Style.RESET_ALL}')
+            else:
+                logger.warning(
+                    f'{colorama.Fore.YELLOW}Consolidation mode is disabled, '
+                    f'but there are {total_jobs} jobs from previous '
+                    'consolidation mode. Reset the `jobs.controller.'
+                    'consolidation_mode` to `true` and run `sky jobs queue` '
+                    'to see those jobs. Switching to normal mode will '
+                    f'lose the job history.{colorama.Style.RESET_ALL}')
+
+
+@annotations.lru_cache(scope='request', maxsize=1)
+def _effective_jobs_consolidation_with_warnings(
+) -> Tuple[bool, Optional[bool]]:
+    """Compute effective jobs consolidation and emit warnings once per request.
+
+    Returns (effective, intent_arg). intent_arg is None when not on the API
+    server (no guidance to emit); otherwise it is the value validators should
+    check — `config_value` when explicitly set, else `effective`.
+
+    Cached on the request scope so the jobs validator and config-vs-signal
+    warning fire at most once per request, even when both managed-jobs and
+    pool readers resolve in the same request.
+    """
+    if os.environ.get(constants.OVERRIDE_CONSOLIDATION_MODE) is not None:
+        # Inside the controller process. Always consolidated from its own
+        # perspective; no admin-facing guidance to emit.
+        return True, None
+    effective = _read_jobs_consolidation_signal()
+    if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
+        # Not on the API server — no config to consult. See #6611.
+        return effective, None
+    config_value = skypilot_config.get_nested(
+        ('jobs', 'controller', 'consolidation_mode'), default_value=None)
+    if config_value is not None and config_value != effective:
+        expected = 'enabled' if config_value else 'disabled'
+        logger.warning(
+            f'{colorama.Fore.YELLOW}Consolidation mode for managed jobs '
+            f'is {expected} in the server config, but the API server has '
+            'not been restarted yet. Please restart the API server to '
+            f'apply the change.{colorama.Style.RESET_ALL}')
+    arg = config_value if config_value is not None else effective
+    warn_jobs_consolidation_mode_intent(arg)
+    return effective, arg
+
+
+def is_jobs_consolidation_mode(
+        extra_validator: Optional[Callable[[bool], None]] = None) -> bool:
+    """Return effective jobs-controller consolidation state.
+
+    Single source of truth for whether the jobs controller is running in
+    consolidation mode. Used by both managed-jobs and pool readers — pool
+    operations run on the jobs controller, so both callers must see the
+    same value.
+
+    Behavior:
+    - OVERRIDE_CONSOLIDATION_MODE env forces True (used inside the
+      controller process itself, which is always consolidated from its
+      own perspective).
+    - Otherwise reads the JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE, written
+      by setup_consolidation_mode_on_startup at API server start.
+    - On the API server (IS_SKYPILOT_SERVER env set): warns if the config
+      disagrees with effective state (user needs to restart), runs the
+      jobs validator against intent (config when set, effective otherwise),
+      and calls extra_validator (if supplied) with the same arg. Callers
+      may use extra_validator for domain-specific warnings (e.g. the pool
+      reader warns about leftover pools in addition to leftover jobs).
+
+    The shared/warning portion is cached per request via
+    _effective_jobs_consolidation_with_warnings so warnings fire once even
+    when multiple readers resolve in the same request. extra_validator is
+    called per invocation; callers should cache their own wrappers if
+    their extra_validator is expensive.
+    """
+    effective, arg = _effective_jobs_consolidation_with_warnings()
+    if extra_validator is not None and arg is not None:
+        extra_validator(arg)
+    return effective
 
 
 @annotations.lru_cache(scope='request')

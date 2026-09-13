@@ -21,7 +21,10 @@ import {
   TableHead,
   TableBody,
   TableCell,
+  EmptyTableState,
 } from '@/components/ui/table';
+import { EmptyState } from '@/components/elements/EmptyState';
+import { isForceEmpty } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { CircularProgress } from '@mui/material';
 import yaml from 'js-yaml';
@@ -41,7 +44,10 @@ import {
 } from '@/components/elements/icons';
 import { ErrorDisplay } from '@/components/elements/ErrorDisplay';
 import { RotateCwIcon, PlusIcon, Trash2Icon, EditIcon } from 'lucide-react';
-import { LastUpdatedTimestamp } from '@/components/utils';
+import {
+  LastUpdatedTimestamp,
+  NonCapitalizedTooltip,
+} from '@/components/utils';
 import { useMobile } from '@/hooks/useMobile';
 import { statusGroups } from './jobs';
 import dashboardCache from '@/lib/cache';
@@ -49,9 +55,11 @@ import { REFRESH_INTERVALS } from '@/lib/config';
 import cachePreloader from '@/lib/cache-preloader';
 import { apiClient } from '@/data/connectors/client';
 import { sortData } from '@/data/utils';
+import { trackWorkspaceAction } from '@/lib/analytics';
 import {
   CLOUD_CANONICALIZATIONS,
   CLUSTER_NOT_UP_ERROR,
+  MANAGED_JOBS_SUMMARY_ARGS,
 } from '@/data/connectors/constants';
 import { getClusters } from '@/data/connectors/clusters';
 import { getManagedJobs } from '@/data/connectors/jobs';
@@ -81,7 +89,7 @@ export async function getWorkspaceManagedJobs(workspaceName) {
     // Use cached global managed jobs data and filter by workspace
     // This avoids making separate API calls per workspace
     const allJobsData = await dashboardCache.get(getManagedJobs, [
-      { allUsers: true, skipFinished: true },
+      MANAGED_JOBS_SUMMARY_ARGS,
     ]);
 
     const allJobs = allJobsData?.jobs || [];
@@ -179,18 +187,38 @@ const WorkspaceConfigDescription = ({ workspaceName, config }) => {
   return null;
 };
 
-// Workspace badge component for private/public status
-const WorkspaceBadge = ({ isPrivate }) => {
-  if (isPrivate) {
-    return (
-      <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-gray-100 text-gray-700 border border-gray-300">
-        Private
-      </span>
-    );
-  }
+// Workspace badge component for private/public status. `readOnly` marks a
+// private workspace that non-members may see but not modify (read-only
+// visibility); an extra "Read-only" chip is shown alongside, with a tooltip
+// clarifying the scope (non-members, not the whole workspace).
+const WorkspaceBadge = ({ isPrivate, readOnly = false }) => {
+  const base =
+    'inline-flex items-center px-2 py-1 rounded-full text-xs font-medium border';
   return (
-    <span className="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium bg-green-100 text-green-700 border border-green-300">
-      Public
+    <span className="inline-flex items-center gap-1">
+      {isPrivate ? (
+        <span className={`${base} bg-gray-100 text-gray-700 border-gray-300`}>
+          Private
+        </span>
+      ) : (
+        <span
+          className={`${base} bg-green-100 text-green-700 border-green-300`}
+        >
+          Public
+        </span>
+      )}
+      {readOnly && (
+        <NonCapitalizedTooltip
+          content="Non-members can view this workspace and its workloads but cannot modify them"
+          className="text-sm text-muted-foreground"
+        >
+          <span
+            className={`${base} whitespace-nowrap bg-blue-100 text-blue-700 border-blue-300`}
+          >
+            Read-only
+          </span>
+        </NonCapitalizedTooltip>
+      )}
     </span>
   );
 };
@@ -418,7 +446,7 @@ export function Workspaces() {
   const fetchJobsData = useCallback(async (workspaceNames) => {
     try {
       const allJobsData = await dashboardCache.get(getManagedJobs, [
-        { allUsers: true, skipFinished: true },
+        MANAGED_JOBS_SUMMARY_ARGS,
       ]);
       const jobs = allJobsData?.jobs || [];
 
@@ -562,6 +590,7 @@ export function Workspaces() {
   }, [fetchData]);
 
   const handleRefresh = useCallback(async () => {
+    trackWorkspaceAction('refresh');
     // Set loading states immediately for responsive UI
     setClustersLoading(true);
     setJobsLoading(true);
@@ -658,6 +687,7 @@ export function Workspaces() {
   }, [workspaceDetails, sortConfig, searchQuery, rawWorkspacesData]);
 
   const handleDeleteWorkspace = (workspaceName) => {
+    trackWorkspaceAction('delete');
     checkPermissionAndAct('cannot delete workspace', () => {
       setDeleteState({
         confirmOpen: true,
@@ -716,12 +746,14 @@ export function Workspaces() {
   };
 
   const handleCreateWorkspace = () => {
+    trackWorkspaceAction('create');
     checkPermissionAndAct('cannot create workspace', () => {
       router.push('/workspace/new');
     });
   };
 
   const handleEditWorkspace = (workspaceName) => {
+    trackWorkspaceAction('edit');
     checkPermissionAndAct('cannot edit workspace', () => {
       router.push(`/workspaces/${workspaceName}`);
     });
@@ -834,13 +866,13 @@ export function Workspaces() {
 
       {/* Search and Create Workspace Row */}
       <div className="flex items-center justify-between mb-4">
-        <div className="relative flex-1 max-w-md">
+        <div className="relative flex-1 sm:flex-none">
           <input
             type="text"
             placeholder="Filter workspaces"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="h-8 w-full px-3 pr-8 text-sm border border-gray-300 rounded-md focus:ring-1 focus:ring-sky-500 focus:border-sky-500 outline-none"
+            className="h-8 w-full sm:w-96 px-3 pr-8 text-sm border border-gray-300 rounded-md focus:ring-0 focus:outline-none"
           />
           {searchQuery && (
             <button
@@ -887,13 +919,14 @@ export function Workspaces() {
       </div>
 
       {/* Workspaces Table */}
-      {workspaceDetails.length === 0 && !isInitialLoad ? (
-        <div className="text-center py-10">
-          <p className="text-lg text-gray-600">No workspaces found.</p>
-          <p className="text-sm text-gray-500 mt-2">
-            Create a cluster to see its workspace here.
-          </p>
-        </div>
+      {(workspaceDetails.length === 0 || isForceEmpty()) && !isInitialLoad ? (
+        <Card>
+          <EmptyState
+            icon={<BookDocIcon className="w-5 h-5" />}
+            title="No workspaces found"
+            description="Create a workspace to organize your clusters and jobs"
+          />
+        </Card>
       ) : (
         <Card>
           <div className="overflow-x-auto rounded-lg">
@@ -943,6 +976,11 @@ export function Workspaces() {
                     const workspaceConfig =
                       rawWorkspacesData?.[workspace.name] || {};
                     const isPrivate = workspaceConfig.private === true;
+                    // Server-computed flag: already accounts for the org-wide
+                    // workspace_config.read_access fallback, so a private
+                    // workspace with no per-workspace override is flagged
+                    // read-only when the global default is read_access: all.
+                    const isReadOnly = workspaceConfig.read_only === true;
 
                     return (
                       <TableRow
@@ -958,7 +996,10 @@ export function Workspaces() {
                             {workspace.name}
                           </button>
                           <span className="ml-2">
-                            <WorkspaceBadge isPrivate={isPrivate} />
+                            <WorkspaceBadge
+                              isPrivate={isPrivate}
+                              readOnly={isReadOnly}
+                            />
                           </span>
                         </TableCell>
                         <TableCell>
@@ -1054,14 +1095,12 @@ export function Workspaces() {
                     );
                   })
                 ) : (
-                  <TableRow>
-                    <TableCell
-                      colSpan={5}
-                      className="text-center py-6 text-gray-500"
-                    >
-                      No workspaces found
-                    </TableCell>
-                  </TableRow>
+                  <EmptyTableState
+                    colSpan={5}
+                    icon={<BookDocIcon className="w-5 h-5" />}
+                    title="No workspaces found"
+                    description="Create a workspace to organize your clusters and jobs"
+                  />
                 )}
               </TableBody>
             </Table>

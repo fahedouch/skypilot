@@ -18,6 +18,8 @@ export const getStatusStyle = (status) => {
     // Cluster specific statuses
     case 'LAUNCHING':
       return 'bg-blue-100 text-sky-blue';
+    case 'UNHEALTHY':
+      return 'bg-red-50 text-red-700';
     case 'RUNNING':
     case 'IN_USE':
       return 'bg-green-50 text-green-700';
@@ -39,6 +41,8 @@ export const getStatusStyle = (status) => {
       return 'bg-yellow-50 text-yellow-700';
     case 'RECOVERING':
       return 'bg-orange-50 text-orange-700';
+    case 'WINDING_DOWN':
+      return 'bg-purple-50 text-purple-700';
     case 'SUBMITTED':
       return 'bg-indigo-50 text-indigo-700';
     case 'STARTING':
@@ -113,6 +117,8 @@ export const getStatusIcon = (status) => {
       return <SquareIcon className="w-3 h-3 mr-1" />;
     case 'SUCCEEDED':
       return <TickIcon className="w-3 h-3 mr-1" />;
+    case 'UNHEALTHY':
+      return <FilledCircleIcon className="w-3 h-3 mr-1" />;
     case 'PENDING':
     case 'RECOVERING':
     case 'SUBMITTED':
@@ -127,6 +133,7 @@ export const getStatusIcon = (status) => {
     case 'REPLICA_INIT':
     case 'NO_REPLICA':
       return <CircleIcon className="w-3 h-3 mr-1" />;
+    case 'WINDING_DOWN':
     case 'PROVISIONING':
     case 'SHUTTING_DOWN':
       return <CircularProgress size={12} className="w-3 h-3 mr-1" />;

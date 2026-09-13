@@ -1,10 +1,59 @@
+import pathlib
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
 
+from sky import logs
+from sky import resources
 from sky import skypilot_config
+from sky.backends import backend_utils
+from sky.catalog import gcp_catalog
+from sky.clouds import Region
+from sky.clouds import Zone
 from sky.clouds.gcp import GCP
 from sky.clouds.utils import gcp_utils
+from sky.provision import common
+from sky.provision.gcp import config as gcp_config
+from sky.provision.gcp import constants as gcp_constants
+from sky.provision.gcp import volume_utils as gcp_volume_utils
+from sky.utils import common_utils
+from sky.utils import config_utils
+from sky.utils import resources_utils
+
+
+def test_gcp_rtxpro6000_instance_type_mapping():
+    # RTXPRO6000 (GCP G4) maps to g4-standard-{48,96,192,384} for 1/2/4/8 GPUs.
+    assert gcp_catalog._ACC_INSTANCE_TYPE_DICTS['RTXPRO6000'] == {
+        1: ['g4-standard-48'],
+        2: ['g4-standard-96'],
+        4: ['g4-standard-192'],
+        8: ['g4-standard-384'],
+    }
+    expected = {
+        'g4-standard-48': 1,
+        'g4-standard-96': 2,
+        'g4-standard-192': 4,
+        'g4-standard-384': 8,
+    }
+    for instance_type, count in expected.items():
+        assert gcp_catalog._INSTANCE_TYPE_TO_ACC[instance_type] == {
+            'RTXPRO6000': count,
+        }
+
+
+@pytest.mark.parametrize(
+    'instance_type',
+    ['g4-standard-48', 'g4-standard-96', 'g4-standard-192', 'g4-standard-384'])
+def test_gcp_g4_uses_hyperdisk_balanced(instance_type):
+    # G4 only supports hyperdisk-balanced (no pd-* support), like n4/a4.
+    tier2name = gcp_volume_utils.get_data_disk_tier_mapping(instance_type)
+    for tier in resources_utils.DiskTier:
+        if tier == resources_utils.DiskTier.BEST:
+            continue
+        assert tier2name[tier] == 'hyperdisk-balanced', (
+            f'{instance_type} tier {tier.value} should be hyperdisk-balanced, '
+            f'got {tier2name[tier]}')
 
 
 @pytest.mark.parametrize((
@@ -164,3 +213,385 @@ def test_gcp_get_user_identities_workspace_cache_bypass():
         # Verify workspace cloud was queried for each call
         assert mock_get_workspace_cloud.call_count == 3
         mock_get_workspace_cloud.assert_any_call('gcp')
+
+
+def _make_subnet(name: str, vpc_name: str, project_id: str = 'test-project'):
+    return {
+        'name': name,
+        'network': f'projects/{project_id}/global/networks/{vpc_name}',
+        'selfLink': f'https://example.com/{name}',
+    }
+
+
+def _make_provision_config(provider_config):
+    return common.ProvisionConfig(
+        provider_config=provider_config,
+        authentication_config={},
+        docker_config={},
+        node_config={},
+        count=1,
+        tags={},
+        resume_stopped_nodes=False,
+        ports_to_open_on_launch=None,
+    )
+
+
+def test_gcp_get_usable_vpc_and_subnet_uses_specified_subnet(monkeypatch):
+    provider_config = {
+        'project_id': 'test-project',
+        'vpc_name': 'train-vpc',
+        'subnet_names': ['train-subnet-b', 'train-subnet-a'],
+    }
+    provision_config = _make_provision_config(provider_config)
+    monkeypatch.setattr(gcp_config, '_list_vpcnets', lambda *args, **kwargs: [{
+        'name': 'train-vpc'
+    }])
+    monkeypatch.setattr(
+        gcp_config, '_list_subnets', lambda *args, **kwargs: [
+            _make_subnet('train-subnet-a', 'train-vpc'),
+            _make_subnet('train-subnet-b', 'train-vpc'),
+        ])
+
+    vpc_name, subnet = gcp_config.get_usable_vpc_and_subnet(
+        'cluster', 'us-central1', provision_config, MagicMock())
+
+    assert vpc_name == 'train-vpc'
+    assert subnet['name'] == 'train-subnet-b'
+
+
+def test_gcp_get_usable_vpc_and_subnet_infers_vpc_from_subnet(monkeypatch):
+    provider_config = {
+        'project_id': 'test-project',
+        'subnet_names': 'train-subnet',
+    }
+    provision_config = _make_provision_config(provider_config)
+    monkeypatch.setattr(
+        gcp_config, '_list_subnets', lambda *args, **kwargs: [
+            _make_subnet('train-subnet', 'train-vpc'),
+        ])
+
+    vpc_name, subnet = gcp_config.get_usable_vpc_and_subnet(
+        'cluster', 'us-central1', provision_config, MagicMock())
+
+    assert vpc_name == 'train-vpc'
+    assert subnet['name'] == 'train-subnet'
+
+
+def test_gcp_get_usable_vpc_and_subnet_rejects_multiple_vpcs(monkeypatch):
+    provider_config = {
+        'project_id': 'test-project',
+        'subnet_names': ['train-subnet-a', 'train-subnet-b'],
+    }
+    provision_config = _make_provision_config(provider_config)
+    monkeypatch.setattr(
+        gcp_config, '_list_subnets', lambda *args, **kwargs: [
+            _make_subnet('train-subnet-a', 'train-vpc-a'),
+            _make_subnet('train-subnet-b', 'train-vpc-b'),
+        ])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        gcp_config.get_usable_vpc_and_subnet('cluster', 'us-central1',
+                                             provision_config, MagicMock())
+
+    assert 'multiple VPCs' in str(exc_info.value)
+
+
+def test_gcp_get_usable_vpc_and_subnet_partial_name_match(monkeypatch):
+    provider_config = {
+        'project_id': 'test-project',
+        'vpc_name': 'train-vpc',
+        'subnet_names': ['missing-subnet', 'train-subnet-b'],
+    }
+    provision_config = _make_provision_config(provider_config)
+    monkeypatch.setattr(gcp_config, '_list_vpcnets', lambda *args, **kwargs: [{
+        'name': 'train-vpc'
+    }])
+    monkeypatch.setattr(
+        gcp_config, '_list_subnets', lambda *args, **kwargs: [
+            _make_subnet('train-subnet-a', 'train-vpc'),
+            _make_subnet('train-subnet-b', 'train-vpc'),
+        ])
+
+    vpc_name, subnet = gcp_config.get_usable_vpc_and_subnet(
+        'cluster', 'us-central1', provision_config, MagicMock())
+
+    assert vpc_name == 'train-vpc'
+    assert subnet['name'] == 'train-subnet-b'
+
+
+def test_gcp_get_usable_vpc_and_subnet_empty_subnet_names(monkeypatch):
+    provider_config = {
+        'project_id': 'test-project',
+        'vpc_name': 'train-vpc',
+        'subnet_names': [],
+    }
+    provision_config = _make_provision_config(provider_config)
+    monkeypatch.setattr(gcp_config, '_list_vpcnets', lambda *args, **kwargs: [{
+        'name': 'train-vpc'
+    }])
+    monkeypatch.setattr(
+        gcp_config, '_list_subnets', lambda *args, **kwargs: [
+            _make_subnet('train-subnet-a', 'train-vpc'),
+            _make_subnet('train-subnet-b', 'train-vpc'),
+        ])
+
+    vpc_name, subnet = gcp_config.get_usable_vpc_and_subnet(
+        'cluster', 'us-central1', provision_config, MagicMock())
+
+    assert vpc_name == 'train-vpc'
+    assert subnet['name'] == 'train-subnet-a'
+
+
+def test_gcp_get_usable_vpc_and_subnet_shared_vpc_with_subnet_names(
+        monkeypatch):
+    provider_config = {
+        'project_id': 'service-project',
+        'vpc_name': 'host-project/train-vpc',
+        'subnet_names': ['train-subnet-b'],
+    }
+    provision_config = _make_provision_config(provider_config)
+    seen_projects = []
+
+    def list_vpcnets(project_id, *args, **kwargs):
+        seen_projects.append(project_id)
+        return [{'name': 'train-vpc'}]
+
+    def list_subnets(project_id, *args, **kwargs):
+        seen_projects.append(project_id)
+        return [
+            _make_subnet('train-subnet-a',
+                         'train-vpc',
+                         project_id='host-project'),
+            _make_subnet('train-subnet-b',
+                         'train-vpc',
+                         project_id='host-project'),
+        ]
+
+    monkeypatch.setattr(gcp_config, '_list_vpcnets', list_vpcnets)
+    monkeypatch.setattr(gcp_config, '_list_subnets', list_subnets)
+
+    vpc_name, subnet = gcp_config.get_usable_vpc_and_subnet(
+        'cluster', 'us-central1', provision_config, MagicMock())
+
+    assert seen_projects == ['host-project', 'host-project']
+    assert vpc_name == 'train-vpc'
+    assert subnet['name'] == 'train-subnet-b'
+    assert subnet['network'] == (
+        'projects/host-project/global/networks/train-vpc')
+
+
+def test_gcp_minimal_compute_permissions_skip_firewall_for_custom_subnet():
+
+    def get_effective_region_config_side_effect(cloud,
+                                                region,
+                                                keys,
+                                                default_value=None,
+                                                **kwargs):
+        del cloud, region, kwargs
+        if keys == ('subnet_names',):
+            return ['train-subnet']
+        return default_value
+
+    with patch.object(skypilot_config,
+                      'get_effective_region_config',
+                      side_effect=get_effective_region_config_side_effect):
+        permissions = gcp_utils.get_minimal_compute_permissions()
+
+    for permission in gcp_constants.FIREWALL_PERMISSIONS:
+        assert permission not in permissions
+
+
+def test_gcp_minimal_compute_permissions_include_firewall_for_empty_subnets():
+
+    def get_effective_region_config_side_effect(cloud,
+                                                region,
+                                                keys,
+                                                default_value=None,
+                                                **kwargs):
+        del cloud, region, kwargs
+        if keys == ('subnet_names',):
+            return []
+        return default_value
+
+    with patch.object(skypilot_config,
+                      'get_effective_region_config',
+                      side_effect=get_effective_region_config_side_effect):
+        permissions = gcp_utils.get_minimal_compute_permissions()
+
+    for permission in gcp_constants.FIREWALL_PERMISSIONS:
+        assert permission in permissions
+
+
+def test_gcp_network_config_override_in_cluster_config(monkeypatch):
+    """Test that GCP network overrides are passed through to the template."""
+    monkeypatch.setattr(common_utils, 'make_cluster_name_on_cloud',
+                        lambda *args, **kwargs: args[0])
+    monkeypatch.setattr(backend_utils, '_get_yaml_path_from_cluster_name',
+                        lambda *args, **kwargs: '/tmp/fake-gcp-yaml-path')
+    monkeypatch.setattr(resources.Resources, 'make_deploy_variables',
+                        lambda *args, **kwargs: {'region': 'us-central1'})
+    monkeypatch.setattr(logs, 'get_logging_agent', lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        backend_utils.auth_utils, 'get_or_generate_keys',
+        lambda *args, **kwargs:
+        ('/tmp/fake-private-key', '/tmp/fake-public-key'))
+
+    config_dict = config_utils.Config.from_dict({})
+    monkeypatch.setattr(skypilot_config, '_get_loaded_config',
+                        lambda *args, **kwargs: config_dict)
+
+    override_configs = {
+        'gcp': {
+            'vpc_name': 'override-vpc',
+            'subnet_names': ['override-subnet'],
+        },
+    }
+
+    def fill_template_side_effect(*args, **kwargs):
+        del kwargs
+        template_vars = args[1]
+        assert template_vars['vpc_name'] == 'override-vpc'
+        assert template_vars['subnet_names'] == ['override-subnet']
+        raise RuntimeError('fake-error')
+
+    monkeypatch.setattr(common_utils, 'fill_template',
+                        fill_template_side_effect)
+
+    with pytest.raises(RuntimeError):
+        backend_utils.write_cluster_config(
+            to_provision=resources.Resources(
+                cloud=GCP(),
+                instance_type='n1-standard-4',
+                _cluster_config_overrides=override_configs),
+            num_nodes=1,
+            cluster_config_template='gcp-ray.yml.j2',
+            cluster_name='fake-gcp-cluster',
+            local_wheel_path=pathlib.Path('fake-wheel-path'),
+            wheel_hash='fake-wheel-hash',
+            region=Region(name='us-central1'),
+            zones=[Zone(name='us-central1-a')])
+
+
+# --- Tests for _is_reservation_bound ---
+
+
+class TestIsReservationBound:
+    """Tests for DENSE/CALENDAR reservation detection."""
+
+    @patch('sky.provision.gcp.instance_utils'
+           '.GCPComputeInstance.load_resource')
+    def test_dense_reservation_returns_true(self, mock_load):
+        """DENSE reservation should trigger RESERVATION_BOUND."""
+        from sky.provision.gcp.instance_utils import _is_reservation_bound
+        mock_compute = MagicMock()
+        mock_load.return_value = mock_compute
+        mock_compute.reservations.return_value.list.return_value \
+            .execute.return_value = {
+                'items': [{
+                    'name': 'my-dense-reservation',
+                    'deploymentType': 'DENSE',
+                }]
+            }
+
+        result = _is_reservation_bound('my-project', 'us-central1-a',
+                                       'my-dense-reservation')
+        assert result is True
+
+        mock_compute.reservations.return_value.list.assert_called_once_with(
+            project='my-project',
+            zone='us-central1-a',
+            filter='name=my-dense-reservation',
+        )
+
+    @patch('sky.provision.gcp.instance_utils'
+           '.GCPComputeInstance.load_resource')
+    def test_standard_reservation_returns_false(self, mock_load):
+        """Standard (SPECIFIC) reservation should not trigger override."""
+        from sky.provision.gcp.instance_utils import _is_reservation_bound
+        mock_compute = MagicMock()
+        mock_load.return_value = mock_compute
+        mock_compute.reservations.return_value.list.return_value \
+            .execute.return_value = {
+                'items': [{
+                    'name': 'my-standard-reservation',
+                    'deploymentType': 'DEPLOYMENT_TYPE_UNSPECIFIED',
+                }]
+            }
+
+        result = _is_reservation_bound('my-project', 'us-central1-a',
+                                       'my-standard-reservation')
+        assert result is False
+
+    @patch('sky.provision.gcp.instance_utils'
+           '.GCPComputeInstance.load_resource')
+    def test_no_deployment_type_returns_false(self, mock_load):
+        """Reservation without deploymentType field should not override."""
+        from sky.provision.gcp.instance_utils import _is_reservation_bound
+        mock_compute = MagicMock()
+        mock_load.return_value = mock_compute
+        mock_compute.reservations.return_value.list.return_value \
+            .execute.return_value = {
+                'items': [{
+                    'name': 'my-reservation',
+                }]
+            }
+
+        result = _is_reservation_bound('my-project', 'us-central1-a',
+                                       'my-reservation')
+        assert result is False
+
+    @patch('sky.provision.gcp.instance_utils'
+           '.GCPComputeInstance.load_resource')
+    def test_reservation_not_found_returns_false(self, mock_load):
+        """Empty list result should return False."""
+        from sky.provision.gcp.instance_utils import _is_reservation_bound
+        mock_compute = MagicMock()
+        mock_load.return_value = mock_compute
+        mock_compute.reservations.return_value.list.return_value \
+            .execute.return_value = {
+                'items': []
+            }
+
+        result = _is_reservation_bound('my-project', 'us-central1-a',
+                                       'nonexistent-reservation')
+        assert result is False
+
+    @patch('sky.provision.gcp.instance_utils'
+           '.GCPComputeInstance.load_resource')
+    def test_api_failure_returns_false(self, mock_load):
+        """API errors should gracefully fall back to False."""
+        from sky.provision.gcp.instance_utils import _is_reservation_bound
+        mock_compute = MagicMock()
+        mock_load.return_value = mock_compute
+        mock_compute.reservations.return_value.list.return_value \
+            .execute.side_effect = Exception('Permission denied')
+
+        result = _is_reservation_bound('my-project', 'us-central1-a',
+                                       'my-reservation')
+        assert result is False
+
+    @patch('sky.provision.gcp.instance_utils'
+           '.GCPComputeInstance.load_resource')
+    def test_full_uri_parses_short_name(self, mock_load):
+        """Full reservation URI should be parsed to short name for API call."""
+        from sky.provision.gcp.instance_utils import _is_reservation_bound
+        mock_compute = MagicMock()
+        mock_load.return_value = mock_compute
+        mock_compute.reservations.return_value.list.return_value \
+            .execute.return_value = {
+                'items': [{
+                    'name': 'my-dense-res',
+                    'deploymentType': 'DENSE',
+                }]
+            }
+
+        full_uri = ('projects/my-project/zones/us-central1-a'
+                    '/reservations/my-dense-res')
+        result = _is_reservation_bound('my-project', 'us-central1-a', full_uri)
+        assert result is True
+
+        mock_compute.reservations.return_value.list.assert_called_once_with(
+            project='my-project',
+            zone='us-central1-a',
+            filter='name=my-dense-res',
+        )

@@ -28,17 +28,21 @@ Batch processing, development, (pre)training, finetuning, hyperparameter sweeps,
 
 Using SkyPilot to run workloads offers these benefits:
 
-.. dropdown:: Unified execution on any cloud, region, and cluster
+.. dropdown:: Unified execution on any cluster, cloud, or region
 
-    Regardless of how many clouds, regions, and clusters you have, you can use a unified interface
+    Regardless of how many clusters, clouds, or regions you have, you can use a unified interface
     to submit, run, and manage workloads on them.
 
     You focus on the workload, and SkyPilot alleviates the burden of
     dealing with cloud infra details and differences.
 
-.. dropdown:: Cost and capacity optimization
+.. dropdown:: Maximize GPU fleet utilization
 
-    When launching a workload, SkyPilot will automatically choose the cheapest and most available infra choice in your search space.
+    When launching a workload, SkyPilot automatically finds an available
+    cluster in your search space. GPU utilization is further maximized through
+    binpacking and queueing.
+
+    If you are provisioning elastic resources (VMs), SkyPilot additionally optimizes for cost by choosing the cheapest and available zone/region/cloud.
 
 .. dropdown:: Auto-failover across infra choices
 
@@ -122,7 +126,7 @@ A *job* is a program you want to run. Two types of jobs are supported:
    * - Jobs are submitted to an existing cluster and reuse that cluster's setup.
      - Each job runs in its own temporary cluster, with auto-recovery.
    * - Ideal for interactive development and debugging on an existing cluster.
-     - Ideal for jobs requiring recovery (e.g., spot instances) or scaling to many parallel jobs.
+     - Ideal for jobs requiring recovery or scaling to many parallel jobs.
 
 
 
@@ -182,15 +186,13 @@ Managed jobs
 
 
 *Managed jobs* automatically provision a temporary cluster for each job and handle
-auto-recovery. A lightweight jobs controller is used to offer hands-off monitoring and recovery.
-You can use ``sky jobs launch`` to launch managed jobs.
+auto-recovery. You can use ``sky jobs launch`` to launch managed jobs.
 
-Managed jobs are especially ideal for running jobs on preemptible spot instances (e.g.,
-finetuning, batch inference). Spot GPUs can typically save 3--6x costs. They are also
-ideal for scaling to many parallel jobs.
+Managed jobs are especially ideal for running jobs that may require retries (e.g., handling job preemptions; running on hardware that may fail).
+They are also ideal for scaling to many parallel jobs.
 
-Suggested pattern: Use clusters to interactively develop and debug your code first, and then
-use managed jobs to run them at scale.
+Suggested pattern: Use clusters (``sky launch``, ``sky exec``) to interactively develop and debug your code first, and then
+use managed jobs (``sky jobs launch``) to run them at scale.
 
 See :ref:`managed-jobs` and :ref:`many-jobs` to get started.
 
@@ -389,38 +391,14 @@ See :ref:`Using Existing Machines <existing-machines>`.
 
 
 
-SkyPilot's cost and capacity optimization
--------------------------------------------------------------------
-
-Whenever new compute is needed for a cluster, job, or service,
-SkyPilot's provisioner natively optimizes for cost and capacity, choosing the infra option that is the cheapest and available.
-
-For example, if you want to launch a cluster with 8 A100 GPUs, SkyPilot will try all infra
-options in the given search space in the "cheapest and available" order,
-with auto-failover:
-
-.. figure:: https://blog.skypilot.co/ai-on-kubernetes/images/failover.png
-   :width: 95%
-   :align: center
-   :alt: SkyPilot auto-failover
-   :class: no-scaled-link
-
-As such, SkyPilot users no longer need to worry about specific infra details, manual retry, or manual setup.
-Workloads also obtain higher GPU capacity and cost savings.
-
-Users can specify each workload's search space. It can be as flexible or as specific as desired. Example search spaces that can be specified:
-
-- Use the cheapest and available GPUs out of a set, ``{A10g:8, A10:8, L4:8, A100:8}``
-- Use my Kubernetes cluster, Slurm cluster, or any accessible clouds (pictured above)
-- Use either a spot or on-demand H100 GPU
-- Use AWS's five European regions only
-- Use a specific zone, region, or cloud
-
-Optimization is performed within the search space.
-See :ref:`auto-failover` for details.
-
 Use SkyPilot locally or deploy for a team
 ----------------------------------------------------------
+
+.. tip::
+
+   Running SkyPilot for a larger team or a larger fleet?
+   :ref:`SkyPilot Platform <skypilot-platform>` offers a managed experience with
+   many new features designed for accelerating your GPU fleets and AI workloads.
 
 SkyPilot can be used locally or deployed as a centralized API server for your team.
 

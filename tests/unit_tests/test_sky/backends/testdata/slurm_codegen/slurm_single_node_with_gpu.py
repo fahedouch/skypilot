@@ -346,11 +346,23 @@ def make_task_bash_script(codegen: str,
     script = [
         textwrap.dedent(f"""\
             #!/bin/bash
-            source ~/.bashrc
+            [ -f ~/.bashrc ] && source ~/.bashrc
             set -a
             . $(conda info --base 2> /dev/null)/etc/profile.d/conda.sh > /dev/null 2>&1 || true
             set +a
             {constants.DEACTIVATE_SKY_REMOTE_PYTHON_ENV}
+            # Activate the default user environment (replaces conda base) so
+            # user commands get a writable python/pip. DEACTIVATE above unsets
+            # VIRTUAL_ENV, so re-activate here to keep it consistent (a venv
+            # uses VIRTUAL_ENV, unlike conda which uses CONDA_PREFIX).
+            # Use getattr with a fallback: this function is embedded into the
+            # on-cluster job program via inspect.getsource (see
+            # sky/backends/task_codegen.py) and evaluated at runtime against the
+            # cluster's own sky.skylet.constants. Older clusters predate
+            # ACTIVATE_SKY_USER_ENV, so referencing it directly would raise
+            # AttributeError; those clusters have no ~/sky-user-env anyway, so an
+            # empty string is the correct no-op.
+            {getattr(constants, 'ACTIVATE_SKY_USER_ENV', '')}
             export PYTHONUNBUFFERED=1
             cd {constants.SKY_REMOTE_WORKDIR}"""),
     ]
@@ -530,24 +542,26 @@ if script or True:
         # SLURM_CPU_BIND, SLURM_NNODES, and SLURM_NODELIST constrain
         # the inner srun to the parent step's allocation. This causes
         # "CPU binding outside of job step allocation" errors.
-        # Unsetting all SLURM_* variables allows this srun to access the full job
-        # allocation. See:
+        # Unsetting SLURM_* variables allows this srun to access the
+        # full job allocation. See:
         # https://support.schedmd.com/show_bug.cgi?id=14298
         # https://github.com/huggingface/datatrove/issues/248
-        cmd_parts = []
-        # Only unset SKY_RUNTIME_DIR for container runs. For non-container
-        # runs, we want to inherit the node-local SKY_RUNTIME_DIR set by
-        # SlurmCommandRunner to avoid SQLite WAL issues on shared filesystems.
-        if False:
-            cmd_parts.append('unset SKY_RUNTIME_DIR;')
-        cmd_parts.extend([
+        #
+        # Preserve SLURM_CONF* (SLURM_CONF, SLURM_CONF_SERVER): srun
+        # needs these to locate slurmctld when /etc/slurm/slurm.conf
+        # is not present and DNS SRV discovery is unavailable. On
+        # sites that distribute the config via SLURM_CONF, stripping
+        # it causes srun to fail with:
+        #   resolve_ctls_from_dns_srv: res_nsearch error: Unknown host
+        #   fetch_config: DNS SRV lookup failed
+        #   fatal: Could not establish a configuration source
+        bash_cmd = shlex.quote(' '.join([
             constants.SKY_SLURM_PYTHON_CMD,
             '-m sky.skylet.executor.slurm',
             runner_args,
-        ])
-        bash_cmd = shlex.quote(' '.join(cmd_parts))
+        ]))
         srun_cmd = (
-            "unset $(env | awk -F= '/^SLURM_/ {print $1}') && "
+            "unset $(env | awk -F= '/^SLURM_/ && $1 !~ /^SLURM_CONF/ {print $1}') && "
             f'srun --export=ALL --quiet --unbuffered --kill-on-bad-exit --jobid=12345 '
             f'--job-name=sky-2{job_suffix} --ntasks-per-node=1 {extra_flags} '
             f'/bin/bash -c {bash_cmd}'

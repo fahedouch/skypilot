@@ -1,10 +1,11 @@
 """Load plugins for the SkyPilot API server."""
 import abc
 import dataclasses
+import enum
 import importlib
 import os
 import typing
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
 from fastapi import FastAPI
 
@@ -33,6 +34,35 @@ _PLUGINS_CONFIG_ENV_VAR = (
     f'{skylet_constants.SKYPILOT_SERVER_ENV_VAR_PREFIX}PLUGINS_CONFIG')
 _REMOTE_PLUGINS_CONFIG_ENV_VAR = (
     f'{skylet_constants.SKYPILOT_SERVER_ENV_VAR_PREFIX}REMOTE_PLUGINS_CONFIG')
+
+
+class PluginContext(enum.Enum):
+    """The process context in which plugins are being loaded.
+
+    Used by plugins to declare via ``BasePlugin.load_contexts`` which process
+    types they want to be installed in. Plugins that don't override
+    ``load_contexts`` load in every context (backward compatible).
+    """
+    # The API server's main process (the entrypoint that runs bootstrap:
+    # DB init, request reset, RBAC pre-load, then uvicorn.run). No FastAPI
+    # ``app`` is exposed here. Use this for plugins that need to register
+    # backends BEFORE main-process bootstrap consumes them.
+    MAIN = 'main'
+    # A uvicorn worker process (or the main process when uvicorn runs
+    # in-process with ``--deploy=false`` / single worker, on the second
+    # plugin load). Has the FastAPI ``app`` available; use this for
+    # registering routes / middleware.
+    UVICORN = 'uvicorn'
+    # A request executor worker subprocess that runs sky API request bodies.
+    EXECUTOR = 'executor'
+    # A jobs/serve controller process, including the codegen prefix that runs
+    # on the remote managed-jobs controller cluster.
+    CONTROLLER = 'controller'
+
+
+# All known contexts. Used as the default for ``BasePlugin.load_contexts`` so
+# that plugins which don't opt in stay loaded in every context.
+ALL_PLUGIN_CONTEXTS: FrozenSet[PluginContext] = frozenset(PluginContext)
 
 
 class ManagedSecretsProvider(abc.ABC):
@@ -86,7 +116,13 @@ class ExtensionContext:
         ]
     """
 
-    def __init__(self, app: Optional[FastAPI] = None):
+    def __init__(
+        self,
+        # Default exists for backward compatibility.
+        context: PluginContext = PluginContext.UVICORN,
+        app: Optional[FastAPI] = None,
+    ):
+        self.context = context
         self.app = app
         self.rbac_rules: List[Tuple[str, RBACRule]] = []
         self._managed_secrets_provider: Optional[ManagedSecretsProvider] = None
@@ -191,6 +227,15 @@ class RBACRule:
 class BasePlugin(abc.ABC):
     """Base class for all SkyPilot server plugins."""
 
+    # Process contexts in which this plugin should be loaded. Defaults to all
+    # known contexts so existing plugins keep loading everywhere.
+    load_contexts: ClassVar[FrozenSet[PluginContext]] = ALL_PLUGIN_CONTEXTS
+
+    @classmethod
+    def should_load(cls, context: PluginContext) -> bool:
+        """Return whether this plugin should be loaded in the given context."""
+        return context in cls.load_contexts
+
     @property
     def name(self) -> Optional[str]:
         """Plugin name for display purposes."""
@@ -255,10 +300,76 @@ class BasePlugin(abc.ABC):
         """
         return []
 
+    @property
+    def viewer_allowlist(self) -> List['RBACRule']:
+        """Endpoints this plugin exposes to viewer-role users.
+
+        Override this property to opt the plugin's read endpoints in to
+        the strictly-read-only `viewer` role.  Endpoints NOT declared
+        here are denied for viewers by default.
+
+        IMPORTANT -- dual contract: this list also classifies an endpoint as
+        read-only for *workspace access* (see
+        `sky.server.requests.workspace_access` /
+        `rbac.get_read_only_endpoints`). An endpoint declared here therefore
+        (a) becomes callable by the viewer role AND (b) needs only *read* on
+        the caller's active workspace, which lets a non-member of a read-only
+        workspace call it. Only declare endpoints that genuinely read; never
+        list one that creates or mutates a workspace-scoped resource, or a
+        non-member could reach it. Endpoints omitted here default to requiring
+        active-workspace *write* (the fail-safe direction), so a plugin's
+        mutating endpoints need no extra declaration to be gated.
+
+        Path patterns use the same Casbin `keyMatch2` syntax as
+        `rbac_rules` (e.g. `/plugins/api/foo/*`, `/plugins/api/foo/:id`).
+
+        Returns:
+            List of `RBACRule` instances (the same dataclass used by
+            `rbac_rules`).  The `description` field is optional; the
+            rule is interpreted as "allow viewers to call this
+            (path, method)".
+
+        Example:
+            @property
+            def viewer_allowlist(self):
+                return [
+                    RBACRule(path='/plugins/api/foo/list',
+                             method='GET'),
+                    RBACRule(path='/plugins/api/foo/status',
+                             method='POST'),
+                ]
+        """
+        return []
+
     @abc.abstractmethod
     def install(self, extension_context: ExtensionContext):
         """Hook called by API server to let the plugin install itself."""
         raise NotImplementedError
+
+    def install_late(self, extension_context: ExtensionContext):
+        """Second install pass, run after every plugin's `install`.
+
+        For middleware that must sit *inside* the middleware other plugins
+        register — anything that reads state an earlier middleware populates,
+        `request.state.auth_user` above all.
+
+        Middleware order is install order: `add_middleware_last` appends to
+        `app.user_middleware`, and the stack is built by wrapping that list in
+        reverse, so an entry appended earlier ends up further out. A plugin
+        registering an authorization middleware in `install` therefore runs
+        outside the authentication middleware of any plugin that happens to be
+        listed after it in the server config, sees no identity, and — since
+        "no identity" conventionally means "local caller, allow" — fails open.
+        Registering it here instead makes it innermost regardless of the
+        configured plugin order.
+
+        Only for that ordering need. Everything else belongs in `install`.
+
+        Raising here aborts the load, exactly as raising from `install` does:
+        plugins are infrastructure, and a half-installed one is not something
+        to serve requests with. "Second pass" does not mean optional.
+        """
+        del extension_context  # Unused by the default no-op.
 
     def shutdown(self):
         """Hook called by API server to let the plugin shutdown."""
@@ -433,6 +544,7 @@ def load_plugins(extension_context: ExtensionContext):
         _plugins_loaded = True
         return
 
+    installed_now: List[Tuple[str, BasePlugin]] = []
     for plugin_config in config.get('plugins', []):
         class_path = plugin_config['class']
         logger.debug(f'Loading plugins: {class_path}')
@@ -453,10 +565,34 @@ def load_plugins(extension_context: ExtensionContext):
         if not issubclass(plugin_cls, BasePlugin):
             raise TypeError(
                 f'Plugin {class_path} must inherit from BasePlugin.')
+        if not plugin_cls.should_load(extension_context.context):
+            logger.debug(f'Skipping plugin {class_path}: not enabled for '
+                         f'context {extension_context.context.value}')
+            continue
         parameters = plugin_config.get('parameters') or {}
         plugin = plugin_cls(**parameters)
         plugin.install(extension_context)
         _PLUGINS[class_path] = plugin
+        installed_now.append((class_path, plugin))
+
+    # Second pass, after every plugin has installed: see
+    # `BasePlugin.install_late`. A plugin whose middleware must be innermost
+    # (because it reads what another plugin's middleware sets) cannot get
+    # there from `install`, where its position depends on where it happens to
+    # sit in the configured plugin list.
+    #
+    # Over what this call installed, not over `_PLUGINS`: that dict is
+    # module-global and never cleared, so in a process that loads plugins more
+    # than once (MAIN, then UVICORN in-process) it still holds instances from
+    # the earlier load — including ones whose `load_contexts` excludes the
+    # context we are in now. Those must not get a late install here.
+    for class_path, plugin in installed_now:
+        try:
+            plugin.install_late(extension_context)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'Plugin {class_path} failed its late install pass: '
+                         f'{common_utils.format_exception(e)}')
+            raise
 
     _plugins_loaded = True
 
@@ -496,6 +632,11 @@ def load_plugin_rbac_rules() -> Dict[str, List[Dict[str, str]]]:
             plugin_cls = getattr(module, class_name)
             if not issubclass(plugin_cls, BasePlugin):
                 continue
+            # RBAC is an API-server concern; skip plugins that don't load
+            # in either API-server context, even if they declare rbac_rules.
+            if not (plugin_cls.should_load(PluginContext.MAIN) or
+                    plugin_cls.should_load(PluginContext.UVICORN)):
+                continue
             parameters = plugin_config.get('parameters') or {}
             plugin = plugin_cls(**parameters)
 
@@ -531,6 +672,69 @@ def get_plugin_rbac_rules() -> Dict[str, List[Dict[str, str]]]:
         }
     """
     return _PLUGIN_RBAC_RULES
+
+
+_PLUGIN_VIEWER_ALLOWLIST: List[Dict[str, str]] = []
+
+
+def load_plugin_viewer_allowlist() -> List[Dict[str, str]]:
+    """Load viewer-allowlist entries from plugins without calling install().
+
+    Mirrors `load_plugin_rbac_rules`: instantiates each configured
+    plugin in API-server-loading contexts and reads its
+    `viewer_allowlist` property.  Side-effect-free.
+
+    Plugins that don't override `viewer_allowlist` inherit the
+    BasePlugin default (empty list), so default behaviour for any
+    plugin endpoint is "denied for viewer".
+
+    Returns:
+        Flat list of `{path, method}` records to add to the viewer
+        allowlist.
+    """
+    global _PLUGIN_VIEWER_ALLOWLIST
+
+    config = _load_plugin_config()
+    if not config:
+        return []
+
+    allowlist: List[Dict[str, str]] = []
+
+    for plugin_config in config.get('plugins', []):
+        class_path = plugin_config['class']
+        module_path, class_name = class_path.rsplit('.', 1)
+        try:
+            module = importlib.import_module(module_path)
+            plugin_cls = getattr(module, class_name)
+            if not issubclass(plugin_cls, BasePlugin):
+                continue
+            # RBAC is an API-server concern; skip plugins that don't load
+            # in either API-server context, even if they declare viewer
+            # rules.
+            if not (plugin_cls.should_load(PluginContext.MAIN) or
+                    plugin_cls.should_load(PluginContext.UVICORN)):
+                continue
+            parameters = plugin_config.get('parameters') or {}
+            plugin = plugin_cls(**parameters)
+
+            for rule in plugin.viewer_allowlist:
+                allowlist.append({
+                    'path': rule.path,
+                    'method': rule.method,
+                })
+                logger.debug(f'Collected viewer allowlist entry from '
+                             f'{class_path}: {rule.method} {rule.path}')
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f'Failed to load viewer allowlist from '
+                           f'{class_path}: {e}')
+
+    _PLUGIN_VIEWER_ALLOWLIST = allowlist
+    return allowlist
+
+
+def get_plugin_viewer_allowlist() -> List[Dict[str, str]]:
+    """Return the cached viewer-allowlist entries collected from plugins."""
+    return _PLUGIN_VIEWER_ALLOWLIST
 
 
 def get_extension_context() -> Optional[ExtensionContext]:

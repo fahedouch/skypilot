@@ -15,6 +15,11 @@ import dashboardCache from '@/lib/cache';
 import cachePreloader from '@/lib/cache-preloader';
 import { checkGrafanaAvailability, getGrafanaUrl } from '@/utils/grafana';
 import { canonicalizeGpuName, CANONICAL_GPU_NAMES } from '@/utils/gpuUtils';
+import {
+  trackEvent,
+  trackPluginPageView,
+  registerAnalyticsProvider,
+} from '@/lib/analytics';
 
 const PluginContext = createContext({
   topNavLinks: [],
@@ -22,6 +27,7 @@ const PluginContext = createContext({
   components: {},
   dataEnhancements: {},
   tableColumns: {},
+  tableFilters: {},
   dataProviders: {},
   recipeTypes: [],
 });
@@ -63,6 +69,7 @@ const initialState = {
   components: {}, // Map of slot name → array of component configs
   dataEnhancements: {}, // Map of dataSource → array of enhancements
   tableColumns: {}, // Map of table name → array of column configs
+  tableFilters: {}, // Map of table name → array of filter property configs
   dataProviders: {}, // Map of provider id → provider config (with useHook)
   recipeTypes: [], // Array of { id, label, fullLabel, icon, color, template }
 };
@@ -73,6 +80,7 @@ const actions = {
   REGISTER_COMPONENT: 'REGISTER_COMPONENT',
   REGISTER_DATA_ENHANCEMENT: 'REGISTER_DATA_ENHANCEMENT',
   REGISTER_TABLE_COLUMN: 'REGISTER_TABLE_COLUMN',
+  REGISTER_TABLE_FILTER: 'REGISTER_TABLE_FILTER',
   REGISTER_DATA_PROVIDER: 'REGISTER_DATA_PROVIDER',
   CLEAR_CACHED_NAV_LINKS: 'CLEAR_CACHED_NAV_LINKS',
   REGISTER_RECIPE_TYPE: 'REGISTER_RECIPE_TYPE',
@@ -146,6 +154,19 @@ function pluginReducer(state, action) {
         ...state,
         tableColumns: {
           ...state.tableColumns,
+          [table]: updated,
+        },
+      };
+    }
+    case actions.REGISTER_TABLE_FILTER: {
+      const { table } = action.payload;
+      const existing = state.tableFilters[table] || [];
+      const updated = upsertById(existing, action.payload);
+      updated.sort((a, b) => (a.order ?? 100) - (b.order ?? 100));
+      return {
+        ...state,
+        tableFilters: {
+          ...state.tableFilters,
           [table]: updated,
         },
       };
@@ -332,9 +353,19 @@ function normalizeRoute(route) {
     ? normalizedPath
     : `/${normalizedPath}`;
 
+  // Optional: the built-in nav link this route belongs under (e.g. '/jobs'),
+  // so the sidebar can highlight it while the route is open. Plugin routes
+  // are all served by one catch-all page, so the router's pathname alone
+  // cannot tell the sidebar which section a plugin page is part of.
+  const navHref =
+    typeof route.navHref === 'string' && route.navHref.startsWith('/')
+      ? route.navHref
+      : undefined;
+
   return {
     id: String(route.id),
     path: pathname,
+    navHref,
     title: typeof route.title === 'string' ? route.title : undefined,
     description:
       typeof route.description === 'string' ? route.description : undefined,
@@ -458,6 +489,34 @@ function normalizeTableColumn(config) {
   };
 }
 
+function normalizeTableFilter(config) {
+  if (
+    !config ||
+    typeof config !== 'object' ||
+    !config.id ||
+    !config.table ||
+    !config.key ||
+    !config.label
+  ) {
+    console.warn(
+      '[SkyDashboardPlugin] Invalid table filter registration:',
+      config
+    );
+    return null;
+  }
+  return {
+    id: String(config.id),
+    table: String(config.table),
+    // Shape of the page filter schemas (e.g. JOB_FILTER_SCHEMA): `key` is
+    // what the URL carries and what the fetch path sends to the provider,
+    // `label` is what the dropdown and the filter chip show.
+    key: String(config.key),
+    label: String(config.label),
+    kind: config.kind ? String(config.kind) : 'text',
+    order: Number.isFinite(config.order) ? config.order : 100,
+  };
+}
+
 /**
  * Normalizes a URL by stripping credentials and ensuring it's safe for history API.
  * This prevents SecurityError when the current URL has credentials but the target URL doesn't.
@@ -516,7 +575,13 @@ function interceptHistoryApi() {
       normalizedUrl = normalizeUrlForHistory(url);
     }
     try {
-      return originalPushState.call(this, state, title, normalizedUrl);
+      const result = originalPushState.call(this, state, title, normalizedUrl);
+      window.dispatchEvent(
+        new CustomEvent('skydashboard:url-changed', {
+          detail: { url: normalizedUrl || url },
+        })
+      );
+      return result;
     } catch (error) {
       // If pushState still fails (e.g., due to origin mismatch), try with a relative URL
       if (
@@ -527,7 +592,18 @@ function interceptHistoryApi() {
         try {
           const urlObj = new URL(normalizedUrl, window.location.href);
           const relativeUrl = urlObj.pathname + urlObj.search + urlObj.hash;
-          return originalPushState.call(this, state, title, relativeUrl);
+          const result = originalPushState.call(
+            this,
+            state,
+            title,
+            relativeUrl
+          );
+          window.dispatchEvent(
+            new CustomEvent('skydashboard:url-changed', {
+              detail: { url: relativeUrl },
+            })
+          );
+          return result;
         } catch {
           // If that also fails, rethrow the original error
           throw error;
@@ -544,7 +620,18 @@ function interceptHistoryApi() {
       normalizedUrl = normalizeUrlForHistory(url);
     }
     try {
-      return originalReplaceState.call(this, state, title, normalizedUrl);
+      const result = originalReplaceState.call(
+        this,
+        state,
+        title,
+        normalizedUrl
+      );
+      window.dispatchEvent(
+        new CustomEvent('skydashboard:url-changed', {
+          detail: { url: normalizedUrl || url },
+        })
+      );
+      return result;
     } catch (error) {
       // If replaceState still fails (e.g., due to origin mismatch), try with a relative URL
       if (
@@ -555,7 +642,18 @@ function interceptHistoryApi() {
         try {
           const urlObj = new URL(normalizedUrl, window.location.href);
           const relativeUrl = urlObj.pathname + urlObj.search + urlObj.hash;
-          return originalReplaceState.call(this, state, title, relativeUrl);
+          const result = originalReplaceState.call(
+            this,
+            state,
+            title,
+            relativeUrl
+          );
+          window.dispatchEvent(
+            new CustomEvent('skydashboard:url-changed', {
+              detail: { url: relativeUrl },
+            })
+          );
+          return result;
         } catch {
           // If that also fails, rethrow the original error
           throw error;
@@ -647,6 +745,17 @@ function createPluginApi(dispatch) {
       });
       return normalized.id;
     },
+    registerTableFilter(config) {
+      const normalized = normalizeTableFilter(config);
+      if (!normalized) {
+        return null;
+      }
+      dispatch({
+        type: actions.REGISTER_TABLE_FILTER,
+        payload: normalized,
+      });
+      return normalized.id;
+    },
     getContext() {
       return {
         basePath: BASE_PATH,
@@ -707,6 +816,15 @@ function createPluginApi(dispatch) {
       // This dynamically provides all components from the ui directory.
       // eslint-disable-next-line no-undef
       return require('@/components/ui');
+    },
+    trackEvent(eventName, properties = {}) {
+      trackEvent(eventName, properties);
+    },
+    trackPluginPageView(pluginName, pagePath) {
+      trackPluginPageView(pluginName, pagePath);
+    },
+    registerAnalyticsProvider(provider) {
+      registerAnalyticsProvider(provider);
     },
     registerRecipeType(config) {
       if (!config || !config.id || !config.label) {
@@ -854,6 +972,12 @@ export function PluginProvider({ children }) {
         // Signal that all plugin scripts have finished loading.
         // layout.jsx listens for this to avoid showing the fallback top bar
         // before the sidebar plugin has had a chance to register.
+        // Also set a synchronously-readable global flag so pages that
+        // mount AFTER this event has fired can detect that state without
+        // waiting on a 2-second safety-net timeout. Without this, every
+        // navigation to a plugin-aware page paid an unconditional 2s
+        // gate before rendering anything.
+        window.__skyDashboardPluginsLoaded = true;
         window.dispatchEvent(new CustomEvent('skydashboard:plugins-loaded'));
       }
     };
@@ -1005,9 +1129,44 @@ export function useTableColumns(tableName, context = {}) {
   }, [tableName, tableColumns, context]);
 }
 
+/**
+ * Hook to access plugin-registered filter properties for a table.
+ *
+ * Each entry is `{ id, table, key, label, kind, order }`, shaped like the
+ * page filter schemas (see e.g. JOB_FILTER_SCHEMA): the page appends these
+ * to its own schema so the dropdown offers them, the URL round-trips them,
+ * and the fetch path forwards their values to the data provider that
+ * registered them. Registration is reactive — a plugin may register after
+ * its first data fetch and the page picks the filters up live.
+ *
+ * @param {string} tableName - The table name (e.g., 'jobs')
+ * @returns {Array} Registered filter property configs, sorted by order
+ */
+export function usePluginTableFilters(tableName) {
+  const { tableFilters } = usePluginState();
+  return useMemo(
+    () => (tableName && tableFilters[tableName]) || [],
+    [tableName, tableFilters]
+  );
+}
+
 export function useDataProvider(id) {
   const { dataProviders } = usePluginState();
   return dataProviders[id] || null;
+}
+
+/**
+ * Hook to access all registered data providers as an array.
+ *
+ * Used by host pages that want to discover plugins exposing a particular
+ * hook by name (e.g., looking for any provider with a `useExtraInfraRows`
+ * hook) without knowing any specific plugin id.
+ *
+ * @returns {Array} All registered data provider configs
+ */
+export function useAllDataProviders() {
+  const { dataProviders } = usePluginState();
+  return Object.values(dataProviders);
 }
 
 /**

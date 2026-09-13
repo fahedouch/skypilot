@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import filelock
 import pytest
@@ -98,6 +98,7 @@ all_clouds_in_smoke_tests = [
     'shadeform',
     'coreweave',
     'vastdata',
+    'huggingface',
     'slurm',
     'mithril',
     'verda',
@@ -131,6 +132,7 @@ cloud_to_pytest_keyword = {
     'seeweb': 'seeweb',
     'coreweave': 'coreweave',
     'vastdata': 'vastdata',
+    'huggingface': 'huggingface',
     'slurm': 'slurm',
     'mithril': 'mithril',
     'verda': 'verda',
@@ -160,6 +162,10 @@ def pytest_addoption(parser):
                      action='store_true',
                      default=False,
                      help='Only run tests for TPU.')
+    parser.addoption('--batch',
+                     action='store_true',
+                     default=False,
+                     help='Only run tests for sky batch.')
     parser.addoption(
         '--generic-cloud',
         type=str,
@@ -240,6 +246,14 @@ def pytest_addoption(parser):
               'ensure the tests will not be skipped but no actual effect)'),
     )
     parser.addoption(
+        '--serve-consolidation',
+        action='store_true',
+        default=False,
+        help=('If set, the tests will be run in serve consolidation mode '
+              '(The config change is made in buildkite so this is a flag to '
+              'ensure the tests will not be skipped but no actual effect)'),
+    )
+    parser.addoption(
         '--grpc',
         action='store_true',
         default=False,
@@ -273,6 +287,13 @@ def pytest_addoption(parser):
         'Use existing cluster for backend integration tests instead of creating a new one',
     )
     parser.addoption(
+        '--concurrency',
+        type=int,
+        default=None,
+        help=('Buildkite concurrency limit per build (configured in pipeline '
+              'generator; has no effect when running locally)'),
+    )
+    parser.addoption(
         '--dependency',
         type=str,
         nargs='?',
@@ -295,6 +316,19 @@ def pytest_configure(config):
     config.addinivalue_line(
         'markers', 'no_auto_retry: mark test to disable automatic retries '
         'in Buildkite CI (manual retries still allowed)')
+    config.addinivalue_line('markers', 'batch: mark test as sky batch specific')
+    config.addinivalue_line(
+        'markers', 'exclusive: mark test that mutates shared server state and '
+        'must run serially; selected only by the pipeline generator\'s '
+        '--exclusive flag and excluded from normal parallel runs')
+    config.addinivalue_line(
+        'markers',
+        'concurrency_group(name): serialize this test globally across all '
+        'Buildkite builds and pipelines by emitting a shared concurrency_group '
+        'with concurrency 1. Use for a test that mutates a shared external '
+        'resource so only one instance runs at a time org-wide, while every '
+        'other test still runs in parallel. The name must be a plain slug '
+        '(no commas or quotes)')
     for cloud in all_clouds_in_smoke_tests:
         cloud_keyword = cloud_to_pytest_keyword[cloud]
         config.addinivalue_line(
@@ -336,7 +370,7 @@ def _get_cloud_to_run(config) -> List[str]:
 
     for cloud in all_clouds_in_smoke_tests:
         if config.getoption(f'--{cloud}'):
-            if cloud in ['cloudflare', 'coreweave', 'vastdata']:
+            if cloud in ['cloudflare', 'coreweave', 'vastdata', 'huggingface']:
                 cloud_to_run.append(default_clouds_to_run[0])
             else:
                 cloud_to_run.append(cloud)
@@ -360,6 +394,8 @@ def pytest_collection_modifyitems(config, items):
         reason='skipped, because --serve option is set')
     skip_marks['tpu'] = pytest.mark.skip(
         reason='skipped, because --tpu option is set')
+    skip_marks['batch'] = pytest.mark.skip(
+        reason='skipped, because --batch option is set')
     skip_marks['local'] = pytest.mark.skip(
         reason='test requires local API server')
     skip_marks['no_remote_server'] = pytest.mark.skip(
@@ -405,6 +441,9 @@ def pytest_collection_modifyitems(config, items):
                     continue
                 if config.getoption('--vastdata') and cloud == 'vastdata':
                     continue
+                if (config.getoption('--huggingface') and
+                        cloud == 'huggingface'):
+                    continue
                 item.add_marker(skip_marks[cloud])
 
         if (not 'managed_jobs'
@@ -414,6 +453,8 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_marks['tpu'])
         if (not 'serve' in item.keywords) and config.getoption('--serve'):
             item.add_marker(skip_marks['serve'])
+        if (not 'batch' in item.keywords) and config.getoption('--batch'):
+            item.add_marker(skip_marks['batch'])
         if ('no_postgres' in item.keywords) and config.getoption('--postgres'):
             item.add_marker(skip_marks['postgres'])
 
@@ -466,10 +507,37 @@ def pytest_collection_modifyitems(config, items):
                 item.add_marker(serial_mark)
                 item._nodeid = f'{item.nodeid}@serial_{generic_cloud_keyword}'  # See comment on item.nodeid above
 
+    # Tag test executions reported to Buildkite Test Engine with the test
+    # configuration, so that test history can be filtered/grouped by
+    # configuration (cloud, server mode, consolidation, etc.). The
+    # ``execution_tag`` marker is provided by buildkite-test-collector.
+    if smoke_tests_utils.is_in_buildkite_env():
+        common_tags = _common_execution_tags(config)
+        for item in items:
+            if 'smoke_tests' not in item.location[0]:
+                continue
+            cloud = _item_cloud(config, item, cloud_to_run, generic_cloud)
+            item.add_marker(pytest.mark.execution_tag('cloud', cloud))
+            for key, value in common_tags.items():
+                item.add_marker(pytest.mark.execution_tag(key, value))
+
     if config.option.collectonly:
         for item in items:
             full_name = item.nodeid
-            marks = [mark.name for mark in item.iter_markers()]
+            marks = []
+            for mark in item.iter_markers():
+                # Surface the argument of a concurrency_group(name) marker so
+                # the pipeline generator can read the group name (all other
+                # markers are matched by name only, so keep them name-only).
+                # Accept both positional (concurrency_group('x')) and keyword
+                # (concurrency_group(name='x')) forms.
+                if mark.name == 'concurrency_group':
+                    group_name = (mark.args[0]
+                                  if mark.args else mark.kwargs.get('name'))
+                    marks.append(f'{mark.name}({group_name})'
+                                 if group_name else mark.name)
+                else:
+                    marks.append(mark.name)
             print(f"Collected {full_name} with marks: {marks}")
 
 
@@ -485,6 +553,77 @@ def _generic_cloud(config) -> str:
     if generic_cloud_option is not None:
         return generic_cloud_option
     return _get_cloud_to_run(config)[0]
+
+
+def _common_execution_tags(config) -> Dict[str, str]:
+    """Session-level execution tags for Buildkite Test Engine.
+
+    These tags describe the test configuration of the current run and are
+    attached to every reported test execution (via the ``execution_tag``
+    marker of buildkite-test-collector), so that test history can be
+    filtered and grouped by configuration in Test Engine.
+
+    Note: Test Engine allows at most 10 custom tags per execution; keep
+    this set (plus the per-item ``cloud`` tag) under that limit.
+    """
+    server = 'local'
+    env_file = config.getoption('--env-file')
+    if env_file and _get_and_check_env_file(env_file)[0]:
+        # The env file points the tests at an existing API server endpoint.
+        server = 'shared'
+    elif config.getoption('--remote-server'):
+        server = 'remote'
+
+    consolidation_modes = [
+        mode for mode, option in (('jobs', '--jobs-consolidation'),
+                                  ('serve', '--serve-consolidation'))
+        if config.getoption(option)
+    ]
+
+    tags = {
+        'server': server,
+        'consolidation': '-'.join(consolidation_modes) or 'none',
+        'db': 'postgres' if config.getoption('--postgres') else 'sqlite',
+    }
+
+    # Agent queue distinguishes the backing infra (e.g. which Kubernetes
+    # backend a test ran on).
+    queue = os.environ.get('BUILDKITE_AGENT_META_DATA_QUEUE')
+    if queue:
+        tags['queue'] = queue
+    if config.getoption('--grpc'):
+        tags['grpc'] = 'true'
+    base_branch = config.getoption('--base-branch')
+    if base_branch:
+        tags['base_branch'] = base_branch
+    controller_cloud = config.getoption('--controller-cloud')
+    if controller_cloud:
+        tags['controller_cloud'] = controller_cloud
+    dependency = config.getoption('--dependency')
+    if dependency != 'all':
+        tags['dependency'] = dependency if dependency else 'base'
+    return tags
+
+
+def _item_cloud(config, item, cloud_to_run: List[str],
+                generic_cloud: str) -> str:
+    """Resolve which cloud a collected test item runs on."""
+    marked_clouds = [
+        cloud for cloud in all_clouds_in_smoke_tests
+        if cloud_to_pytest_keyword[cloud] in item.keywords
+    ]
+    if not marked_clouds:
+        # Generic test: runs on the generic cloud.
+        return generic_cloud
+    # A test may be marked for multiple clouds; prefer the one that is
+    # active in this run.
+    for cloud in marked_clouds:
+        if cloud in cloud_to_run or config.getoption(f'--{cloud}'):
+            return cloud
+    # None of the marked clouds is active in this run, so the item is
+    # collected but skipped. Tag it with its first marked cloud rather
+    # than the generic cloud of the run.
+    return marked_clouds[0]
 
 
 @annotations.lru_cache(scope='session')
@@ -763,10 +902,8 @@ def setup_docker_container(request):
         # Use create_and_setup_new_container to create and start the container
         docker_utils.create_and_setup_new_container(
             target_container_name=docker_utils.get_container_name(),
-            api_server_host_port=docker_utils.get_api_server_host_port(),
-            api_server_container_port=46580,
-            metrics_host_port=docker_utils.get_metrics_host_port(),
-            metrics_container_port=9090,
+            api_server_container_port=docker_utils.API_SERVER_CONTAINER_PORT,
+            metrics_container_port=docker_utils.METRICS_CONTAINER_PORT,
             username=default_user)
 
         logger.info(f'Container {docker_utils.get_container_name()} started')

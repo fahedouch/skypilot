@@ -30,6 +30,7 @@ enum ManagedJobStatus {
   MANAGED_JOB_STATUS_FAILED_PRECHECKS = 11;
   MANAGED_JOB_STATUS_FAILED_NO_RESOURCE = 12;
   MANAGED_JOB_STATUS_FAILED_CONTROLLER = 13;
+  MANAGED_JOB_STATUS_WINDING_DOWN = 14;
 }
 
 enum ManagedJobScheduleState {
@@ -90,6 +91,14 @@ message GetJobTableRequest {
   // Sorting parameters, added in ManagedJobsService v14.
   optional string sort_by = 13;
   optional string sort_order = 14;
+  // Time-range filter on submitted_at (epoch seconds), added in
+  // ManagedJobsService v22.
+  optional double submitted_after = 15;
+  optional double submitted_before = 16;
+  // `--infra` spec to filter on, added in ManagedJobsService v24. A server
+  // that predates it ignores this field, so the response reports back whether
+  // it was honoured rather than leaving the caller to assume it was.
+  optional string infra_match = 17;
 }
 
 message ManagedJobInfo {
@@ -144,6 +153,12 @@ message ManagedJobInfo {
   map<string, string> internal_services = 36;
   // Named priority class for job scheduling
   optional string priority_class = 37;
+  // Whether this job is a batch coordinator (ds.map()).
+  optional bool is_batch = 38;
+  // Batch progress: total number of batches (NULL for non-batch jobs).
+  optional int32 batch_total_batches = 39;
+  // Batch progress: number of completed batches (NULL for non-batch jobs).
+  optional int32 batch_completed_batches = 40;
 }
 
 // A pair of internal and external IP addresses
@@ -157,6 +172,18 @@ message GetJobTableResponse {
   int32 total = 2;
   int32 total_no_filter = 3;
   map<string, int32> status_counts = 4;
+  // Whether `infra_match` was applied, added in ManagedJobsService v24.
+  // Unlike a filter that merely widens the result when it is dropped, an
+  // ignored infra filter returns jobs on other infra -- an answer that looks
+  // right and is wrong. A server that predates the field leaves it false, so
+  // the caller can tell "filtered to none" from "never filtered".
+  bool infra_match_applied = 5;
+  // The distinct `--infra` specs across the jobs the request's other filters
+  // select, for the dashboard's Infra filter to offer. Added in
+  // ManagedJobsService v24. A server that predates the field leaves it empty,
+  // which is not an error the way a dropped `infra_match` is: the caller falls
+  // back to deriving the options from the rows on the page.
+  repeated string infra_options = 6;
 }
 
 message GetAllJobIdsByNameRequest {

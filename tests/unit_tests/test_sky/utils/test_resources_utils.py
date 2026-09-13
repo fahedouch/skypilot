@@ -1,10 +1,12 @@
 """Tests for resources_utils.py."""
+import types
 import unittest
 
 import pytest
 
 from sky import clouds
 from sky import resources as resources_lib
+from sky.provision import common as provision_common
 from sky.utils import resources_utils
 
 
@@ -120,6 +122,103 @@ def test_aws_instance_type_shown():
     assert 'm5.large' in simple
 
 
+def _k8s_resource():
+    return resources_lib.Resources(cloud=clouds.Kubernetes(),
+                                   instance_type='2CPU--4GB',
+                                   cpus=2,
+                                   memory=4)
+
+
+def test_format_resource_prefers_actual_pod_requests():
+    """Actual pod resource requests take precedence over the spec values.
+
+    E.g., an admin policy can rewrite kubernetes.pod_config resource
+    requests without touching the SkyPilot resources spec.
+    """
+    simple, full = resources_utils.format_resource(_k8s_resource(),
+                                                   simplified_only=False,
+                                                   actual_cpus=8.0,
+                                                   actual_memory_gb=1984.0)
+
+    assert 'cpus=8' in simple
+    assert 'mem=1984' in simple
+    assert 'cpus=2' not in simple
+    assert 'mem=4' not in simple
+    # The full string keeps the diverging spec values visible.
+    assert 'cpus=8 (requested: 2)' in full
+    assert 'mem=1984 (requested: 4)' in full
+
+
+def test_format_resource_actual_matches_spec_no_annotation():
+    """No annotation when the actual requests match the spec values."""
+    simple, full = resources_utils.format_resource(_k8s_resource(),
+                                                   simplified_only=False,
+                                                   actual_cpus=2.0,
+                                                   actual_memory_gb=4.0)
+
+    assert 'cpus=2' in simple
+    assert 'mem=4' in simple
+    assert 'requested' not in full
+
+
+def test_format_resource_unmodified_pod_memory_unit_convention():
+    """An unmodified pod must not be reported as a divergence.
+
+    The pod template writes spec memory as decimal G, which reads back
+    in GiB as spec * (1000^3 / 1024^3). This is a unit convention, not
+    an override, so the spec value stays displayed with no annotation.
+    """
+    read_back_gib = 4.0 * (1000**3 / 1024**3)  # ~3.73
+    simple, full = resources_utils.format_resource(
+        _k8s_resource(),
+        simplified_only=False,
+        actual_cpus=2.0,
+        actual_memory_gb=read_back_gib)
+
+    assert 'mem=4' in simple
+    assert 'mem=3.73' not in simple
+    assert 'requested' not in full
+
+
+def test_get_readable_resources_repr_uses_cached_cluster_info():
+    """Handle display prefers actual requests from cached_cluster_info."""
+    cluster_info = provision_common.ClusterInfo(instances={},
+                                                head_instance_id=None,
+                                                provider_name='kubernetes',
+                                                actual_cpus=8.0,
+                                                actual_memory_gb=1984.0)
+    handle = types.SimpleNamespace(launched_resources=_k8s_resource(),
+                                   launched_nodes=2,
+                                   cached_cluster_info=cluster_info)
+
+    simple, full = resources_utils.get_readable_resources_repr(
+        handle, simplified_only=False)
+
+    assert simple.startswith('2x')
+    assert 'cpus=8' in simple
+    assert 'mem=1984' in simple
+    assert 'mem=1984 (requested: 4)' in full
+
+
+def test_get_readable_resources_repr_old_pickled_cluster_info():
+    """ClusterInfo pickled before the actual_* fields existed still works."""
+
+    class _OldClusterInfo:
+        # Simulates an unpickled ClusterInfo from an older version: the
+        # new dataclass fields are absent from __dict__ entirely.
+        pass
+
+    handle = types.SimpleNamespace(launched_resources=_k8s_resource(),
+                                   launched_nodes=1,
+                                   cached_cluster_info=_OldClusterInfo())
+
+    simple, _ = resources_utils.get_readable_resources_repr(
+        handle, simplified_only=False)
+
+    assert 'cpus=2' in simple
+    assert 'mem=4' in simple
+
+
 class TestNormalizeLocalDisk:
     """Tests for normalize_local_disk function."""
 
@@ -223,6 +322,36 @@ class TestNormalizeLocalDisk:
     def test_weird_device_name(self):
         with pytest.raises(ValueError, match='Invalid local_disk'):
             resources_utils.normalize_local_disk('fakessd')
+
+    def test_non_numeric_size_suppresses_chained_exception(self):
+        """The user-facing ValueError should not be chained from the
+        internal float() ValueError. Previously the traceback printed both
+        'could not convert string to float' and the user-friendly message.
+        """
+        with pytest.raises(ValueError) as e:
+            resources_utils.normalize_local_disk('foo')
+        assert e.value.__suppress_context__ is True
+
+
+class TestParseMemoryResource:
+    """Tests for parse_memory_resource error message quality."""
+
+    def test_invalid_input_has_readable_error(self):
+        """Error for invalid memory input should be human-readable.
+
+        Previously the message concatenated the raw regex pattern and a
+        stray '+?,' suffix, yielding
+        '"memory" field should be a ^[0-9]+(kb|ki|...)?$+?, got xyz'.
+        """
+        with pytest.raises(ValueError) as e:
+            resources_utils.parse_memory_resource('xyz', 'memory')
+        msg = str(e.value)
+        # The garbled '+?' suffix should not appear in the user-facing error.
+        assert '?$+?' not in msg
+        assert '?$' not in msg
+        # The field name and the offending value should both be named.
+        assert 'memory' in msg
+        assert 'xyz' in msg
 
 
 class TestParseLocalDiskStr:

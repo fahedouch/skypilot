@@ -1,16 +1,18 @@
-SkyPilot: Run AI on Any Infrastructure
-======================================
+.. rst-class:: hero-title
+
+SkyPilot: Manage all your AI compute
+=========================================
 
 .. image:: /_static/SkyPilot_wide_dark.svg
-  :width: 50%
+  :width: 38%
   :align: center
   :alt: SkyPilot
-  :class: no-scaled-link, only-dark
+  :class: no-scaled-link, only-dark, hero-logo
 .. image:: /_static/SkyPilot_wide_light.svg
-  :width: 50%
+  :width: 38%
   :align: center
   :alt: SkyPilot
-  :class: no-scaled-link, only-light
+  :class: no-scaled-link, only-light, hero-logo
 
 .. raw:: html
 
@@ -33,21 +35,11 @@ SkyPilot gives **AI teams** a simple interface to run jobs on any infra.
 .. image:: ../images/skypilot-abstractions-long-2.png
     :width: 90%
     :align: center
-    :class: only-light
+    :class: only-light, hero-diagram
 .. image:: ../images/skypilot-abstractions-long-2-dark.png
     :width: 90%
     :align: center
-    :class: only-dark
-
-.. grid:: 1 1 1 1
-    :gutter: 3
-
-    .. grid-item-card::
-        :link: https://demo.skypilot.co/dashboard/
-        :text-align: center
-
-        🌟 **SkyPilot Demo** 🌟: Click to see a 1-minute tour
-
+    :class: only-dark, hero-diagram
 
 Why SkyPilot
 ----------------------
@@ -70,11 +62,11 @@ SkyPilot **unifies multiple clusters, clouds, and hardware**:
 - :ref:`Flexible provisioning <auto-failover>` of GPUs, TPUs, CPUs, with smart failover
 - :ref:`Team deployment <sky-api-server>` and resource sharing
 
-SkyPilot **cuts your cloud costs & maximizes GPU availability**:
+SkyPilot **maximizes GPU fleet utilization**:
 
 * Autostop: automatic cleanup of idle resources
-* :ref:`Spot instance support <spot-jobs>`: 3-6x cost savings, with preemption auto-recovery
-* Intelligent scheduling: automatically run on the cheapest & most available infra
+* Binpacking: workload binpacking on shared clusters
+* Intelligent scheduler: automatically schedule on the most available infra
 
 .. raw:: html
 
@@ -208,8 +200,8 @@ SkyPilot **cuts your cloud costs & maximizes GPU availability**:
 
 SkyPilot supports your existing GPU, TPU, and CPU workloads, with no code changes.
 
-Current supported infra: Kubernetes, Slurm, AWS, GCP, Azure, OCI, Nebius, Lambda Cloud, RunPod, Fluidstack,
-Cudo, Digital Ocean, Paperspace, Cloudflare, Samsung, IBM, Vast.ai, VMware vSphere, Seeweb, Prime Intellect.
+Current supported infra: Kubernetes, Slurm, AWS, GCP, Azure, OCI, CoreWeave, Nebius, Lambda Cloud, RunPod, Fluidstack,
+Cudo, Digital Ocean, Paperspace, Cloudflare, Samsung, IBM, Vast.ai, VMware vSphere, Seeweb, Prime Intellect, Shadeform, Verda Cloud, VastData, Crusoe.
 
 .. raw:: html
 
@@ -227,23 +219,23 @@ Getting started
 
 SkyPilot is BYOC: Everything is launched within your cloud accounts, VPCs, and clusters.
 
-Can I use SkyPilot on Kubernetes?
-----------------------------------
+Benefits of SkyPilot on Kubernetes
+-----------------------------------
 
-Yes. SkyPilot makes Kubernetes easy for AI teams via AI-native optimizations.
+SkyPilot makes Kubernetes AI-native.
 
 It turbocharges your existing Kubernetes clusters by **accelerating AI/ML velocity**:
 
 - AI-friendly interface to launch jobs and deployments
 - Much simplified interactive dev for K8s (SSH / sync code / connect IDE to pods)
 
-...and **optimizing GPU costs, utilization, and scaling**:
+...and **optimizing GPU scheduling, utilization, and scaling**:
 
 - Advanced scheduling: Gang scheduling, multi-node jobs, and queueing
-- Multi-cluster support: One entrypoint to use compute across one or many clusters
-- Multi-cloud bursting: Get global GPU capacity without pre-provisioning clusters
+- Multi-cluster support: Bring all your clusters under one control plane
+- Multi-cloud support: One consistent interface to manage many providers
 
-See :ref:`SkyPilot vs Vanilla Kubernetes <sky-compare>` and this `blog post <https://blog.skypilot.co/ai-on-kubernetes/>`_ for more details.
+See :ref:`SkyPilot vs Vanilla Kubernetes <sky-compare>` and this `blog post <https://skypilot.ai/blog/ai-on-kubernetes>`_ for more details.
 
 Contact the SkyPilot team
 ---------------------------------
@@ -253,26 +245,17 @@ You can chat with the SkyPilot team and community on the `SkyPilot Slack <http:/
 Learn more
 --------------------------
 
-To learn more, see :ref:`SkyPilot Overview <overview>` and `SkyPilot blog <https://blog.skypilot.co/>`_.
+To learn more, see :ref:`SkyPilot Overview <overview>` and `SkyPilot blog <https://skypilot.ai/blog>`_.
 
-SkyPilot adopters: `Testimonials and Case Studies <https://blog.skypilot.co/case-studies/>`_
-
-Partners and integrations: `Community Spotlights <https://blog.skypilot.co/community/>`_
+SkyPilot adopters: `Testimonials and Case Studies <https://skypilot.ai/case-studies>`_
 
 Follow updates:
 
 * `Slack <http://slack.skypilot.co>`_
-* `X / Twitter <https://twitter.com/skypilot_org>`_
+* `X <https://twitter.com/skypilot_org>`_
 * `LinkedIn <https://www.linkedin.com/company/skypilot-oss/>`_
-* `SkyPilot Blog <https://blog.skypilot.co/>`_ (`Introductory blog post <https://blog.skypilot.co/introducing-skypilot/>`_)
-
-Read the research:
-
-* `SkyPilot paper <https://www.usenix.org/system/files/nsdi23-yang-zongheng.pdf>`_ and `talk <https://www.usenix.org/conference/nsdi23/presentation/yang-zongheng>`_ (NSDI 2023)
-* `Sky Computing whitepaper <https://arxiv.org/abs/2205.07147>`_
-* `Sky Computing vision paper <https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s02-stoica.pdf>`_ (HotOS 2021)
-* `SkyServe: AI serving across regions and clouds <https://arxiv.org/pdf/2411.01438>`_ (EuroSys 2025)
-* `Managed jobs spot instance policy <https://www.usenix.org/conference/nsdi24/presentation/wu-zhanghao>`_ (NSDI 2024)
+* `YouTube <https://www.youtube.com/@skypilot-org>`_
+* `SkyPilot Blog <https://skypilot.ai/blog>`_
 
 .. toctree::
    :hidden:
@@ -285,6 +268,7 @@ Read the research:
    Agent Skills <../getting-started/skill>
    ../examples/index
    ../sky-computing
+   SkyPilot Platform <../skypilot-platform>
 
 .. toctree::
    :hidden:
@@ -307,15 +291,16 @@ Read the research:
    Many Parallel Jobs <../running-jobs/many-jobs>
    Model Training Guide <../reference/training-guide>
    Using a Pool of Workers <../examples/pools>
-   Job Groups <../examples/job-groups>
+   Batch Inference <../examples/batch/index>
+   Job Groups for RL <../examples/job-groups>
 
 .. toctree::
    :hidden:
    :maxdepth: 1
    :caption: Model Serving
 
-   Getting Started <../serving/sky-serve>
-   ../serving/user-guides
+   SkyPilot Endpoints <https://skypilot.ai/blog/skypilot-endpoints>
+   SkyServe <../serving/sky-serve>
 
 .. toctree::
    :hidden:
@@ -352,6 +337,7 @@ Read the research:
    ../running-jobs/environment-variables
    Docker Containers <../examples/docker-containers>
    ../examples/ports
+   ../reference/lifecycle-hooks
    ../reference/logging
    ../reference/faq
 

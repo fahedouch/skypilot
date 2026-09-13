@@ -1,9 +1,10 @@
-SkyPilot: Run AI on Any Infrastructure
+SkyPilot: Manage all your AI compute
 ======================================
 
 
 .. raw:: html
 
+   <style>html, body { visibility: hidden; }</style>
    <script type="text/javascript">
        window.location.href = "docs/index.html";
    </script>
@@ -15,6 +16,6 @@ SkyPilot: Run AI on Any Infrastructure
    :hidden:
 
    Docs <docs/index>
-   Case Studies <https://blog.skypilot.co/case-studies/>
-   Blog <https://blog.skypilot.co/>
+   Case Studies <https://skypilot.ai/case-studies>
+   Blog <https://skypilot.ai/blog>
 

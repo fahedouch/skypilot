@@ -87,6 +87,18 @@ def test_validate_file_mounts():
         }
         task_obj.expand_and_validate_file_mounts()
 
+        # Test relative destinations (resolved against ~/sky_workdir).
+        task_obj.file_mounts = {
+            'relative_dir': d,
+            './dotslash_relative_dir': d,
+        }
+        task_obj.expand_and_validate_file_mounts()
+
+        # Test trailing-slash destinations are still rejected.
+        task_obj.file_mounts = {'/remote/': d}
+        with pytest.raises(ValueError, match='cannot end with a slash'):
+            task_obj.expand_and_validate_file_mounts()
+
 
 def test_to_yaml_config_without_envs():
     """Test to_yaml_config() with no environment variables."""
@@ -380,13 +392,37 @@ def test_from_yaml_config_secrets_type_conversion():
     assert task.get_plaintext_secrets(task_obj.secrets)['EMPTY_KEY'] == ''
 
 
-def test_from_yaml_config_secrets_validation():
-    """Test validation of secrets during YAML parsing."""
-    # Test None secret value
+def test_from_yaml_config_null_secret_becomes_managed_ref():
+    """A null secret value (no inline value) becomes a managed secret ref.
+
+    It is resolved at launch time (CLI ``--secret`` override or a managed
+    secrets provider) rather than rejected during YAML parsing.
+    """
     config = {'run': 'echo hello', 'secrets': {'API_KEY': None}}
 
-    with pytest.raises(ValueError, match='Secret variable.*is None'):
-        task.Task.from_yaml_config(config)
+    task_obj = task.Task.from_yaml_config(config)
+
+    assert task_obj.secrets == {}
+    refs = task_obj.managed_secret_refs
+    assert len(refs) == 1
+    assert refs[0].name == 'API_KEY'
+    assert refs[0].scope_override is None
+
+
+def test_from_yaml_config_null_or_empty_secrets_section():
+    """A null/empty ``secrets:`` section parses cleanly (no crash)."""
+    # ``secrets:`` with no value parses to None in YAML.
+    task_obj = task.Task.from_yaml_config({
+        'run': 'echo hello',
+        'secrets': None
+    })
+    assert task_obj.secrets == {}
+    assert not task_obj.managed_secret_refs
+
+    # Empty dict form.
+    task_obj = task.Task.from_yaml_config({'run': 'echo hello', 'secrets': {}})
+    assert task_obj.secrets == {}
+    assert not task_obj.managed_secret_refs
 
 
 def test_task_initialization_with_secrets():
@@ -454,19 +490,26 @@ def test_from_yaml_config_null_secrets_with_override():
     assert task_obj.envs == {'PUBLIC_VAR': 'public-value'}
 
 
-def test_from_yaml_config_null_secrets_without_override_fails():
-    """Test that null secrets without override fail appropriately."""
+def test_from_yaml_config_null_secrets_without_override_become_managed_refs():
+    """Without a CLI override, a null secret parses into a managed ref.
+
+    The value is resolved at launch time; enforcement of a missing value
+    moved from parse time to resolution time.
+    """
     config = {
-        'name': 'test-null-fail',
+        'name': 'test-null-managed-ref',
         'run': 'echo hello',
         'secrets': {
             'API_KEY': None
         }
     }
 
-    # Should fail without override
-    with pytest.raises(ValueError, match="Secret variable 'API_KEY' is None"):
-        task.Task.from_yaml_config(config)
+    task_obj = task.Task.from_yaml_config(config)
+
+    assert task_obj.secrets == {}
+    refs = task_obj.managed_secret_refs
+    assert len(refs) == 1
+    assert refs[0].name == 'API_KEY'
 
 
 def test_from_yaml_config_partial_null_secrets_override():
@@ -816,6 +859,49 @@ def test_resolve_volumes_dict_volume_success():
             assert r.cloud == registry.CLOUD_REGISTRY.from_str('aws')
 
 
+def test_resolve_volumes_inline_slurm_host_path():
+    t = task.Task.from_yaml_str("""
+resources:
+  cloud: slurm
+volumes:
+  /data:
+    host_path: /host/data
+  /scratch:
+    host_path: /host/scratch
+    mode: rw
+""")
+
+    t.resolve_and_validate_volumes()
+
+    assert t.volume_mounts is not None
+    assert [(mount.path, mount.volume_config.name_on_cloud,
+             mount.volume_config.config) for mount in t.volume_mounts] == [
+                 ('/data', '/host/data', {
+                     'host_path': '/host/data',
+                     'mode': 'ro',
+                 }),
+                 ('/scratch', '/host/scratch', {
+                     'host_path': '/host/scratch',
+                     'mode': 'rw',
+                 }),
+             ]
+
+
+@pytest.mark.parametrize('host_path,mode,error', [
+    ('relative/path', 'ro', 'absolute path'),
+    ('/', 'ro', 'root directory'),
+    ('/host/data', 'read-only', 'Supported modes'),
+])
+def test_resolve_volumes_inline_slurm_host_path_validation(
+        host_path, mode, error):
+    t = task.Task(resources=resources_lib.Resources(
+        cloud=registry.CLOUD_REGISTRY.from_str('slurm')))
+    t._volumes = {'/data': {'host_path': host_path, 'mode': mode}}
+
+    with pytest.raises(ValueError, match=error):
+        t.resolve_and_validate_volumes()
+
+
 def test_resolve_volumes_topology_conflict_between_volumes():
     t = task.Task()
     t._volumes = {'/mnt1': 'vol1', '/mnt2': 'vol2'}
@@ -922,14 +1008,15 @@ def test_resolve_volumes_dict_with_name_and_size():
         mock_resolve.assert_not_called()
 
 
-def test_resolve_volumes_invalid_dict_no_size_no_name():
-    """Test dict without 'size' or 'name' raises ValueError."""
+def test_resolve_volumes_invalid_dict_no_source():
+    """Test a dict without a supported volume source raises ValueError."""
     t = task.Task()
     t._volumes = {'/mnt': {'type': 'pd-standard'}}
     t.resources = [make_mock_resource()]
 
-    with pytest.raises(ValueError,
-                       match='Invalid volume config.*Either "size".*or "name"'):
+    with pytest.raises(
+            ValueError,
+            match='Invalid volume config.*"size".*"name".*"host_path"'):
         t.resolve_and_validate_volumes()
 
 
@@ -939,8 +1026,9 @@ def test_resolve_volumes_invalid_dict_empty():
     t._volumes = {'/mnt': {}}
     t.resources = [make_mock_resource()]
 
-    with pytest.raises(ValueError,
-                       match='Invalid volume config.*Either "size".*or "name"'):
+    with pytest.raises(
+            ValueError,
+            match='Invalid volume config.*"size".*"name".*"host_path"'):
         t.resolve_and_validate_volumes()
 
 
@@ -1317,6 +1405,65 @@ def test_multinode_rwo_volume_raises():
         }
         with pytest.raises(ValueError, match='ReadWriteOnce.*multi-node'):
             t.resolve_and_validate_volumes()
+
+
+def test_managed_secret_refs_round_trip_with_inline_secrets():
+    """managed_secret_refs must keep their bare name across YAML round-trips
+    even when the task also carries inline ``_secrets``.
+
+    Regression test for the ``Secret not found: secrets:secrets:NAME`` bug:
+    when inline secrets are present (e.g. via the
+    ``SKYPILOT_SERVICE_ACCOUNT_TOKEN`` injection in
+    ``sky/jobs/server/core.py`` for ``api_server_access`` jobs),
+    ``_to_yaml_config`` routes refs into the ``managed_secrets:`` field
+    with a ``secrets:`` prefix. Path 2 (``managed_secrets:``) parsing must
+    strip that prefix so the round-trip is symmetric — otherwise each
+    serialize/parse cycle (e.g. one for the controller, one for
+    ``recovery_strategy.sdk.launch``) accumulates another ``secrets:``
+    layer and the SecretsManager plugin fails to resolve the ref.
+    """
+    # pylint: disable=protected-access
+    config = {
+        'run': 'echo hello',
+        'secrets': ['secrets:my_secret'],
+    }
+    task_obj = task.Task.from_yaml_config(config)
+    assert len(task_obj._managed_secret_refs) == 1
+    assert task_obj._managed_secret_refs[0].name == 'my_secret'
+
+    # Simulate the inline-secret injection path used by api_server_access:
+    # this forces ``config['secrets']`` to be a dict on serialize, which
+    # routes refs into the ``managed_secrets:`` field.
+    task_obj._secrets['INJECTED_TOKEN'] = SecretStr('token-value')
+
+    # First round-trip.
+    yaml_config = task_obj._to_yaml_config()
+    assert isinstance(yaml_config.get('secrets'), dict)
+    assert yaml_config.get('managed_secrets') == ['secrets:my_secret']
+
+    task_obj2 = task.Task.from_yaml_config(yaml_config)
+    assert len(task_obj2._managed_secret_refs) == 1
+    assert task_obj2._managed_secret_refs[0].name == 'my_secret'
+
+    # Second round-trip — pre-fix this would yield ``secrets:secrets:my_secret``.
+    yaml_config2 = task_obj2._to_yaml_config()
+    assert yaml_config2.get('managed_secrets') == ['secrets:my_secret']
+
+    task_obj3 = task.Task.from_yaml_config(yaml_config2)
+    assert task_obj3._managed_secret_refs[0].name == 'my_secret'
+
+
+def test_managed_secret_name_with_scope_and_secrets_prefix():
+    """``_parse_secret_name`` strips ``secrets:`` and a scope prefix together."""
+    # pylint: disable=protected-access
+    # pylint: disable=import-outside-toplevel
+    from sky.task import _parse_secret_name
+    assert _parse_secret_name('foo') == ('foo', None)
+    assert _parse_secret_name('secrets:foo') == ('foo', None)
+    assert _parse_secret_name('personal.foo') == ('foo', 'personal')
+    assert _parse_secret_name('secrets:personal.foo') == ('foo', 'personal')
+    assert _parse_secret_name('secrets:workspace.foo') == ('foo', 'workspace')
+    assert _parse_secret_name('secrets:global.foo') == ('foo', 'global')
 
 
 def test_multinode_rwx_volume_passes():
